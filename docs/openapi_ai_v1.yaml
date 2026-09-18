@@ -1,0 +1,298 @@
+openapi: 3.0.3
+info:
+  title: AI inference server (구음장애 보조)
+  version: ai-contract-v1
+  description: >
+    Machine-readable form of docs/AI_BACKEND_CONTRACT_v1_EN.md. The prose document is
+    authoritative for rules (confirmation gate, consent, adapter binding); this file fixes
+    shapes. Reference implementation: demo/server.py.
+servers:
+  - url: http://127.0.0.1:8000
+paths:
+  /v1/health:
+    get:
+      summary: Engine, model versions, loaded adapters, input limits
+      responses:
+        "200":
+          description: ok
+          content: {application/json: {schema: {$ref: "#/components/schemas/Health"}}}
+  /v1/asr/transcribe:
+    post:
+      summary: Recognize one utterance (WAV PCM16 mono 16 kHz, 0.3-30 s)
+      parameters:
+        - {name: user_id, in: query, required: true, schema: {type: string}}
+        - {name: use_adapter, in: query, required: false, schema: {type: boolean, default: true}}
+        - {name: request_id, in: query, required: false, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          audio/wav:
+            schema: {type: string, format: binary}
+      responses:
+        "200":
+          description: recognition result (status ok or no_speech)
+          content: {application/json: {schema: {$ref: "#/components/schemas/Transcription"}}}
+        "400": {$ref: "#/components/responses/Error"}
+        "413": {$ref: "#/components/responses/Error"}
+        "415": {$ref: "#/components/responses/Error"}
+        "422": {$ref: "#/components/responses/Error"}
+  /v1/transcriptions/{transcription_id}/confirm:
+    post:
+      summary: Confirm (optionally edited) text. Backend-owned in the product.
+      parameters:
+        - {name: transcription_id, in: path, required: true, schema: {type: string, format: uuid}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ConfirmRequest"}
+      responses:
+        "200":
+          description: confirmation
+          content: {application/json: {schema: {$ref: "#/components/schemas/Confirmation"}}}
+        "404": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+        "422": {$ref: "#/components/responses/Error"}
+  /v1/tts:
+    post:
+      summary: Obtain the only text the client may speak. Backend-owned in the product.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [confirmation_id, idempotency_key]
+              properties:
+                confirmation_id: {type: string, format: uuid}
+                idempotency_key: {type: string}
+      responses:
+        "200":
+          description: text to speak (replayed=true on retry with the same key)
+          content: {application/json: {schema: {$ref: "#/components/schemas/Tts"}}}
+        "404": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+  /v1/analysis/jamo-errors:
+    post:
+      summary: Jamo-level MODEL-error statistics (jamo-err-v1)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pairs]
+              properties:
+                pairs:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required: [ref, hyp]
+                    properties:
+                      ref: {type: string, description: "known prompt or independent human correction; never model output"}
+                      hyp: {type: string}
+                min_support: {type: integer, default: 20}
+      responses:
+        "200":
+          description: statistics
+          content: {application/json: {schema: {$ref: "#/components/schemas/JamoStats"}}}
+        "422": {$ref: "#/components/responses/Error"}
+  /v1/enroll/next-prompts:
+    post:
+      summary: Next enrollment sentences. v1 strategy = random only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id]
+              properties:
+                user_id: {type: string}
+                n: {type: integer, minimum: 1, maximum: 50, default: 10}
+                strategy: {type: string, enum: [random, coverage, error_based], default: random}
+                seed: {type: integer, default: 0}
+                exclude_prompt_ids: {type: array, items: {type: string}}
+      responses:
+        "200":
+          description: prompts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  strategy: {type: string}
+                  strategy_version: {type: string}
+                  seed: {type: integer}
+                  pool_size: {type: integer}
+                  prompts:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        prompt_id: {type: string}
+                        text: {type: string}
+        "501": {$ref: "#/components/responses/Error"}
+  /v1/adapters/train:
+    post:
+      summary: "[planned] Start an adapter training job. 501 in the v1 demo."
+      responses:
+        "501": {$ref: "#/components/responses/Error"}
+components:
+  responses:
+    Error:
+      description: typed error
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error]
+            properties:
+              error:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+                additionalProperties: true
+  schemas:
+    ModelInfo:
+      type: object
+      required: [engine, base_model, base_revision, adapter_id, adapter_revision]
+      properties:
+        engine: {type: string}
+        base_model: {type: string}
+        base_revision: {type: string, nullable: true}
+        adapter_id: {type: string, nullable: true}
+        adapter_revision: {type: string, nullable: true}
+    Transcription:
+      type: object
+      required: [contract_version, transcription_id, request_id, user_id, revision, status, text,
+                 alternatives, score, score_type, model, decoding, audio, latency_ms, created_at]
+      properties:
+        contract_version: {type: string, example: ai-contract-v1}
+        transcription_id: {type: string, format: uuid}
+        request_id: {type: string}
+        user_id: {type: string}
+        revision: {type: integer, example: 1}
+        status: {type: string, enum: [ok, no_speech]}
+        text: {type: string}
+        alternatives:
+          type: array
+          maxItems: 0
+          items: {type: string}
+          description: always empty in v1
+        score: {type: number, nullable: true, description: always null in v1}
+        score_type: {type: string, nullable: true, description: required whenever score is non-null}
+        model: {$ref: "#/components/schemas/ModelInfo"}
+        decoding:
+          type: object
+          properties:
+            language: {type: string, example: ko}
+            task: {type: string, example: transcribe}
+            beam_size: {type: integer, example: 1}   # 1 = greedy (D9)
+        audio:
+          type: object
+          properties:
+            sha256: {type: string}
+            duration_sec: {type: number}
+            rms_dbfs: {type: number}
+            preprocessing_version: {type: string, example: pp-v1}
+        latency_ms: {type: integer}
+        created_at: {type: string}
+    ConfirmRequest:
+      type: object
+      required: [revision, confirmed_text]
+      properties:
+        revision: {type: integer}
+        confirmed_text: {type: string, minLength: 1}
+        consent:
+          type: object
+          properties:
+            store_audio: {type: boolean, default: false}
+            use_for_training: {type: boolean, default: false}
+    Confirmation:
+      type: object
+      properties:
+        confirmation_id: {type: string, format: uuid}
+        transcription_id: {type: string, format: uuid}
+        based_on_revision: {type: integer}
+        confirmed_text: {type: string}
+        text_sha256: {type: string}
+        source: {type: string, enum: [asr_unedited, user_edited]}
+        edit_distance_syl: {type: integer}
+        consent:
+          type: object
+          properties:
+            store_audio: {type: boolean}
+            use_for_training: {type: boolean}
+        supersedes: {type: string, nullable: true}
+        valid: {type: boolean}
+        confirmed_at: {type: string}
+    Tts:
+      type: object
+      properties:
+        tts_id: {type: string, format: uuid}
+        confirmation_id: {type: string, format: uuid}
+        text: {type: string}
+        text_sha256: {type: string}
+        engine: {type: string, example: client_speech_synthesis}
+        replayed: {type: boolean}
+        created_at: {type: string}
+    JamoStats:
+      type: object
+      properties:
+        metric_version: {type: string, example: jamo-err-v1}
+        min_support: {type: integer}
+        pairs_used: {type: integer}
+        reference_tokens: {type: integer}
+        insertions:
+          type: array
+          items:
+            type: object
+            properties:
+              token: {type: string}
+              position: {type: string, enum: [initial, medial, final]}
+              count: {type: integer}
+        tokens:
+          type: array
+          items:
+            type: object
+            properties:
+              token: {type: string}
+              position: {type: string, enum: [initial, medial, final]}
+              errors: {type: integer}
+              sample_count: {type: integer}
+              error_rate: {type: number, nullable: true}
+              status: {type: string, enum: [ok, insufficient_data]}
+              silent_initial: {type: boolean}
+    Health:
+      type: object
+      properties:
+        status: {type: string}
+        contract_version: {type: string}
+        engine: {type: string}
+        base_model: {type: string}
+        base_revision: {type: string, nullable: true}
+        preprocessing_version: {type: string}
+        beam_size: {type: integer}
+        adapters:
+          type: array
+          items:
+            type: object
+            properties:
+              adapter_id: {type: string}
+              user_id: {type: string}
+              adapter_revision: {type: string}
+              size_bytes: {type: integer}
+              label: {type: string, nullable: true}
+              evidence: {type: string, nullable: true}
+        limits:
+          type: object
+          properties:
+            min_sec: {type: number}
+            max_sec: {type: number}
+            sample_rate: {type: integer}
+            channels: {type: integer}
+            bits: {type: integer}

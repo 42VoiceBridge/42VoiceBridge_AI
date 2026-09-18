@@ -1,0 +1,52 @@
+# Allowlist. Everything is ignored; code and specs are added back explicitly.
+# Reason: this repo must never receive AI-Hub 013 audio, labels, or anything derived
+# from them (redistribution conditions apply). A denylist fails open; this fails closed.
+
+*
+!*/
+
+# --- allowed: repo meta
+!.gitignore
+!README.md
+
+# --- allowed: demo AI server (contract v1 reference implementation)
+!demo/*.py
+!demo/requirements.txt
+!demo/README_*.md
+!demo/static/*.html
+
+# --- allowed: experiment code and Colab launchers
+!experiments/**/*.py
+!experiments/**/*.ipynb
+
+# --- allowed: the AI <-> backend contract
+!docs/AI_BACKEND_CONTRACT_v1_EN.md
+!docs/openapi_ai_v1.yaml
+
+# --- denied unconditionally (these win: last match decides) -------------------
+# AI-Hub audio, labels and every derivative
+*.wav
+*.mp3
+*.m4a
+*.pdf
+*_manifest.json
+hyp*.json
+canon_*.json
+script_pool.json
+cp_files.*
+data/
+demo/samples/
+demo/adapters/
+experiments/*/b0*_16k/
+experiments/*/b0*_result/
+experiments/*/results/
+experiments/*/segments/
+# adapters are LoRA weights trained on AI-Hub audio: derived data, not code
+*.safetensors
+*.pt
+*.bin
+# working files that are not the record
+.venv/
+__pycache__/
+*.pyc
+.DS_Store

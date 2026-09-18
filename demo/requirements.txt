@@ -1,0 +1,13 @@
+# Real engine only. The mock engine (ASR_ENGINE=mock) needs numpy alone.
+# Install the SAME peft/transformers major versions that trained the adapter
+# (see experiments/b1_pilot/results/<run>/summary.json -> versions).
+numpy
+torch
+transformers>=4.40
+peft>=0.10
+safetensors
+
+# Verified working on the Mac 2026-09-18 [M]: this range resolved to
+# torch 2.14.0, transformers 5.17.0, peft 0.21.0, numpy 2.4.6, tokenizers 0.23.2
+# (macOS 26.6.2 arm64, Python 3.11.6). Server + 37/37 contract checks + 10 samples passed.
+# Do NOT pin yet: the Colab B1 run (T2) fixes the versions the adapter must be loaded with.
