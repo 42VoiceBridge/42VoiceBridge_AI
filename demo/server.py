@@ -45,9 +45,11 @@ PREPROC_VERSION = "pp-v1"          # WAV PCM16 mono 16 kHz, no resampling, no VA
 MIN_SEC, MAX_SEC = 0.3, 30.0
 SILENCE_DBFS = -60.0               # heuristic, not validated: below this RMS -> no_speech
 BASE = os.environ.get("ASR_BASE", "openai/whisper-small")
-# Greedy by default (D9, 2026-09-18). beam_size=5 made whisper-small emit repetition loops on
-# short utterances (`아, 그래요?` -> 200 tokens of `아`); greedy also scored better on the only
-# held-out set measured (KJW test syllable CER 0.1031 greedy vs 0.1134 at 5). See HO §5.2.
+# Greedy by default (D9, 2026-09-18). At beam_size=5 whisper-small emitted repetition loops on
+# short utterances (`아, 그래요?` -> 200 tokens of `아`), and one such segment can dominate a
+# pooled CER. Accuracy is NOT the reason for greedy: it is a wash (better on the KJW test split,
+# worse on the 10 demo samples). The reasons are that greedy cannot produce the loop, and median
+# demo latency fell 1554 -> 666 ms. See HO §5.2 and CT §0 D9.
 BEAMS = int(os.environ.get("ASR_BEAMS", "1"))
 ENGINE = os.environ.get("ASR_ENGINE", "hf")
 ADAPTER_DIR = os.environ.get("ASR_ADAPTERS", os.path.join(HERE, "adapters"))

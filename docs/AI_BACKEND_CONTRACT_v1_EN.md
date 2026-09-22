@@ -4,7 +4,8 @@
 **Audience:** backend track (민수) and any LLM assisting it. Frontend (채영) reads §3 and §6.
 **Reference implementation:** `demo/server.py` (stdlib HTTP + numpy; real engine needs torch,
 transformers, peft). **Conformance tests:** `demo/test_contract.py` — 40 checks (37 when no adapter user is given), all passing
-against the mock engine on 2026-09-18. The real engine has not been run yet (see §9).
+against the mock engine on 2026-09-18, and 40/40 against the real engine with real trained adapters
+for `KJW` and `CYU` on the same day (see §9).
 **Machine-readable:** `docs/openapi_ai_v1.yaml`.
 
 Evidence tags as in `BACKEND_HANDOFF_EN.md`: **[M]** measured, **[P]** planned, **[U]** unverified.
@@ -224,8 +225,11 @@ a lock because a PEFT model holds one active adapter at a time).
 
 | Item | Status |
 |---|---|
-| Contract behaviour (40 checks) against mock engine | **[M]** pass, 2026-09-18 |
-| Demo page flow (sample → recognize → edit → confirm → speak gate; mic path) in headless Chromium against mock engine | **[M]** pass, 2026-09-18 |
-| Real engine (`HFEngine`) loading whisper-small + PEFT adapters | **[U]** not run: Hugging Face was blocked from the build environment. First run is on the team Mac |
-| Latency on the target machine | **[U]** not measured |
-| Adapter size | **[P]** measured by `b1_train.py` (`summary.json → adapter.bytes`) on the first Colab run |
+| Contract behaviour against mock engine | **[M]** 40/40, 2026-09-18 |
+| Contract behaviour against the real engine (`HFEngine`, whisper-small + PEFT), Mac M2 Pro, CPU | **[M]** 37/37 without adapters; **40/40 with real Colab-trained adapters for `KJW` and for `CYU`**, 2026-09-18 |
+| Demo page flow (sample → recognize → edit → confirm → speak gate) | **[M]** pass against mock (headless Chromium) and against the real engine (in-app browser) |
+| Latency, server-side, 10 demo samples, CPU, greedy (D9) | **[M]** median 666 ms, max 752 ms; with a user adapter ~845 ms. One page request under browser CPU contention took 4091 ms at beam 5 (n=1, cause unverified) |
+| Adapter artifact | **[M]** 14,176,064 bytes (14.18 MB) per user; rank 32, `q_proj,v_proj`, 1.44% of parameters trainable |
+| Adapter portability across library versions | **[M]** trained on Colab (torch 2.11, transformers 5.16.1, peft 0.20.0), served on the Mac (torch 2.14, transformers 5.17.0, peft 0.21.0) without error |
+| Recognition accuracy | **[pilot]** only — two low-baseline speakers, unlistened segments, one seed. Not a product number; see the AI owner before quoting anything |
+| Hosting for team integration | **[P]** not decided: the server currently runs on the AI owner's Mac |

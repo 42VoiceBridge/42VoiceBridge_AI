@@ -22,6 +22,7 @@
 # --- allowed: the AI <-> backend contract
 !docs/AI_BACKEND_CONTRACT_v1_EN.md
 !docs/openapi_ai_v1.yaml
+!docs/BACKEND_SPEC_FOR_CLAUDE_v1_EN.md
 
 # --- denied unconditionally (these win: last match decides) -------------------
 # AI-Hub audio, labels and every derivative

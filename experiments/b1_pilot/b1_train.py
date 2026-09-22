@@ -50,7 +50,8 @@ def die(msg):
 
 
 try:
-    from b0_run import cer, count_digits, norm_syl, selftest, to_jamo  # noqa: F401
+    from b0_run import (PAIRED_SYSTEMS, SCORING_VERSION, cer, count_digits,  # noqa: F401
+                        norm_syl, number_bearing, selftest, to_jamo)
 except ImportError:
     die("b0_run.py not found. Put it at MyDrive/ (it already is if you ran B0) or next to "
         "this script. The scorer must be the B0 scorer, unchanged.")
@@ -299,7 +300,7 @@ def main():
 
     # ------------------------------------------------ scoring
     systems = list(hyp)
-    summ = dict(run_id=run_id, version=RUN_VERSION, speaker=a.speaker, n=a.n, seed=a.seed,
+    summ = dict(run_id=run_id, version=RUN_VERSION, scoring_version=SCORING_VERSION, speaker=a.speaker, n=a.n, seed=a.seed,
                 enroll=dict(n=len(enroll), sec=round(sum(x["sec"] for x in enroll), 1),
                             seg_ids=[x["seg_id"] for x in enroll]),
                 selected_epoch=best["epoch"], history=history,
@@ -316,11 +317,19 @@ def main():
                     "syllables - selection bias toward easier edges",
                     "low-baseline speakers; not the target population",
                     "single seed unless repeated",
-                    "B0 scorer: digits and non-Hangul are deleted before scoring"])
+                    "B0 scorer: digits and non-Hangul are deleted before scoring; segments where a digit appears on either side are reported separately as *_no_number (score-v2)"])
     for split, rows in (("dev", devset), ("test", test)):
         summ["results"][split] = {s: score(rows, hyp[s]) for s in systems}
-        clean = [x for x in rows if all(count_digits(hyp[s][x["seg_id"]]) == 0 for s in systems)]
-        summ["results"][split + "_no_digit_outputs"] = {s: score(clean, hyp[s]) for s in systems}
+        # score-v2: membership depends on the reference and the PAIRED systems only, never on
+        # whether an optional reference pass (large_b0) happened to run in this invocation.
+        paired = [s for s in PAIRED_SYSTEMS if s in hyp]
+        clean = [x for x in rows
+                 if not number_bearing(x["text"], [hyp[s][x["seg_id"]] for s in paired])]
+        summ["results"][split + "_no_number"] = {s: score(clean, hyp[s]) for s in systems}
+        # legacy (score-v1) kept for traceability: hypothesis-only, all systems. Do not headline.
+        legacy = [x for x in rows if all(count_digits(hyp[s][x["seg_id"]]) == 0 for s in systems)]
+        summ["results"][split + "_no_digit_outputs__legacy_v1"] = {
+            s: score(legacy, hyp[s]) for s in systems}
         ok = [x for x in rows if not any(runaway(x["text"], hyp[s][x["seg_id"]]) for s in systems)]
         summ["results"][split + "_no_runaway"] = {s: score(ok, hyp[s]) for s in systems}
     summ["runaway"] = {s: sorted(x["seg_id"] for x in devset + test
@@ -354,7 +363,7 @@ def main():
     json.dump(meta, open(os.path.join(adir, "meta.json"), "w", encoding="utf-8"),
               ensure_ascii=False, indent=1)
     print("\n=== %s  [pilot] ===" % run_id)
-    for split in ("test", "test_no_digit_outputs", "test_no_runaway"):
+    for split in ("test", "test_no_number", "test_no_runaway"):
         print(split)
         for s in systems:
             r = summ["results"][split][s]

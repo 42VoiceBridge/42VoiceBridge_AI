@@ -512,3 +512,32 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# --- scoring rule frozen 2026-09-18 (score-v2). Additive: cer()/norm_syl() are unchanged. ---
+SCORING_VERSION = "score-v2"
+
+PAIRED_SYSTEMS = ("small_b0", "small_b1")   # the b0-vs-b1 comparison. Reference systems
+                                            # (e.g. large_b0) must NEVER change the denominator.
+
+
+def number_bearing(ref, hyps):
+    """True if this segment's score is distorted by norm_syl deleting digits.
+
+    norm_syl strips digits from reference AND hypothesis, so any segment where a digit appears
+    on either side is scored against a mutilated string: a digit-writing system gets a free pass
+    where the label spelled the number out, and vice versa. Measured 2026-09-18: the labels use
+    BOTH conventions, even within one speaker (CYU 13 segments with digits, 13 with money spelled
+    in Hangul; KJW 0 with digits) - so the distortion has no fixed direction and cannot be
+    corrected by choosing one convention.
+
+    `hyps` = the hypotheses of the PAIRED systems only. This is the part that was wrong before:
+    the old filter tested whichever systems a run happened to include, so adding a large-v3
+    reference pass silently removed segments and the n30 and nall conditions ended up scored on
+    different sets (KJW 49 vs 48, CYU 100 vs 99).
+
+    Not fixed here, deliberately: converting between digits and Hangul numerals needs the
+    Sino-Korean/native distinction and the labels do not follow it consistently (HO §4:
+    `육십 이 살` where the counter demands `예순두 살`). A converter would add its own error rate
+    to the metric. Excluding and counting is honest; guessing the reading is not.
+    """
+    return bool(count_digits(ref)) or any(count_digits(h) for h in hyps)
