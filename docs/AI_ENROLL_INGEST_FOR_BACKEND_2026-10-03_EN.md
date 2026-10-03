@@ -1,8 +1,15 @@
 # Enrollment ingest is live — AI → Backend, 2026-10-03
 
 Status: **pushed to `42VoiceBridge_AI` `main`, commit `1d3fbed`.** Your question **T3** is answered
-in code, not in prose. `POST /v1/adapters/train` is reachable now; you can drop the public
-`503 TRAINING_UNAVAILABLE`.
+in code, not in prose. `POST /v1/adapters/train` is reachable now.
+
+**That removes the AI-side reason for your `503 TRAINING_UNAVAILABLE`; it does not by itself make
+it safe to drop.** Your comment in `TrainPersonalizationModelService` cites our 501 and our
+missing job route, and both of those facts have changed. But accepting a public train request
+still needs your client work: deliver the recordings and verify receipt, submit with an agreed
+retry/idempotency rule, store the BE-job ↔ AI-job mapping, synchronise outcomes including a
+normal `rejected`, and confirm actual activation before you report personalization as active.
+Keep the 503 until those exist; just stop attributing it to us.
 
 Two things to know before reading further:
 
@@ -210,8 +217,23 @@ Env knobs you may need: `ASR_ENGINE`, `ASR_ALLOW_UNREVIEWED`, `ASR_BASE_REVISION
 changes a policy we never validated — if you lower them, say so in the job record, because a
 5-item enrollment cannot support a 5-item gate.
 
-Suites, all passing on the real engine: `test_core.py` 24 groups, `test_contract.py` 54 HTTP
-checks, `test_activation.py` 7, `test_train_worker.py` 7.
+### What the test suites do and do not prove
+
+An earlier draft of this document said the suites were "all passing on the real engine." That was
+wrong and it is corrected here, because you would otherwise read model evidence into a plumbing
+result. Three of the four run on the mock engine or on stubs by construction.
+
+| Suite | Engine | What it establishes |
+|---|---|---|
+| `test_contract.py` 54 checks | **real** (run against a live `transformers+peft` server, 2026-10-03) | HTTP contract: status codes, response fields, audio limits, the enrollment routes, path-traversal refusal |
+| `test_core.py` 24 groups | mock (`ASR_ENGINE` defaults to mock) | the `core_*` contract functions, independent of transport |
+| `test_activation.py` 7 groups | mock, in a real server subprocess | that an adapter promoted while the server is running is picked up, and rollback — adapter *selection*, not recognition |
+| `test_train_worker.py` 7 groups | trainer and gate **stubbed** | job state machine, split disjointness, tie-does-not-promote, failure never touching `active.json` |
+
+So: a real HTTP process is not a real inference test. The only real-weight evidence we have is
+separate from these suites — a single-speaker adapter run and the short-utterance evaluation on
+two speakers, both on rented GPUs, both reported with their own caveats. Nothing here measures
+recognition quality.
 
 `docs/openapi_ai_v1.yaml` now documents these three routes, `POST /v1/adapters/train` 202/409 and
 `GET /v1/jobs/{job_id}` with the full job schema. It was behind the code when you read it on
