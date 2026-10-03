@@ -43,8 +43,8 @@ def wav_bytes(seconds=1.0):
     return buf.getvalue()
 
 
-def transcribe(user_id, use_adapter=True):
-    q = "?user_id=%s&use_adapter=%s" % (user_id, "true" if use_adapter else "false")
+def transcribe(user_id, use_adapter=True, extra=""):
+    q = "?user_id=%s&use_adapter=%s%s" % (user_id, "true" if use_adapter else "false", extra)
     req = urllib.request.Request(BASE + "/v1/asr/transcribe" + q, data=wav_bytes(),
                                  headers={"Content-Type": "audio/wav"}, method="POST")
     with urllib.request.urlopen(req, timeout=10) as r:
@@ -129,6 +129,17 @@ def main():
         r = transcribe("u3")
         assert r["model"]["adapter_id"] is None
         assert r["model"]["base_reason"] == "adapter_not_found", r["model"]
+        ok += 1
+
+        # 8. a client-supplied adapter_id must not select a model for this user. test_contract.py
+        # asserts this too, but only inside an "an adapter is active" branch that is skipped when
+        # no active.json exists - so in practice it was never executed. Here an adapter IS active.
+        set_active(adapters, {"u1": "u1-v1"})
+        assert transcribe("u1")["model"]["adapter_id"] == "u1-v1"      # u1 has one
+        r = transcribe("u9", extra="&adapter_id=u1-v1")                # u9 does not
+        assert r["model"]["adapter_id"] is None, (
+            "a client-supplied adapter_id selected another user's adapter: %r" % r["model"])
+        assert r["model"]["base_reason"] == "no_active_adapter", r["model"]
         ok += 1
 
         print("activation checks passed (%d groups)" % ok)

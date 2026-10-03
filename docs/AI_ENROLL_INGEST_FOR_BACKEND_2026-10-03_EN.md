@@ -160,6 +160,12 @@ without. Your UI needs a non-error way to say it.
 
 There is still **no numeric progress**. Keep `progress: null` (your T8).
 
+To verify *which* model ran on a given utterance, send the **same WAV twice** — once with
+`use_adapter=true`, once with `use_adapter=false` — and compare `model.adapter_id`. A
+client-supplied `adapter_id` query value is deliberately **ignored**: a caller must not be able to
+select another user's adapter, and there is no authentication here to make that safe. That is
+asserted by `test_activation.py` group 8.
+
 Verify which model actually ran from the transcribe response, not from your DB:
 `model.adapter_id` plus `model.base_reason` (`no_active_adapter`, `base_requested`,
 `adapter_wrong_owner`, `adapter_not_found`, `adapter_base_mismatch`, `adapter_load_error`;
@@ -190,7 +196,7 @@ much as ours; we are not treating push as settled.
 | **Adapter retirement after withdrawal (your T9)** | Deleting a recording does not retire adapters trained from it. No policy agreed. Options: retire immediately, retrain without the item, or record the lineage and decide per request. Needs your product/legal view. |
 | **No authentication** | The server has none. If anything but localhost can reach it, you own the boundary. |
 | **First-request latency** | The model loads at startup, but the first inference after that is ~2.7 s on a laptop CPU (warm: 640–680 ms). Your `read-timeout-ms` is 10000, so you are fine — but do not call it during startup. |
-| **`base_revision` reports `null` when loading from an offline cache** | The weights *are* the pinned revision `973afd24…` (the loader passes it and the cache snapshot path is that hash), but `config._commit_hash` is unset in offline mode, so the server cannot *prove* it to you. Affects your A1/A5. Being fixed by reporting the requested pin and the artifact-confirmed value separately. |
+| ~~`base_revision` reports `null` when loading from an offline cache~~ **Fixed 2026-10-03** | The value is now confirmed from the artifact: `config._commit_hash` when present, otherwise the commit sha in the `.../snapshots/<sha>/` path of the `config.json` actually loaded. `GET /v1/health` and the transcribe `model` block carry `base_revision_verified` and `base_revision_source`; if neither route confirms it you get the requested pin with `verified: false`, which you should treat as unproven. Measured on the real engine: `973afd24…`, `verified: true`, source `cache_snapshot_path`. Your **A1/A5**. |
 | ~~Split membership is not permanent across rounds~~ **Fixed 2026-10-03** | Membership is now persisted per user in `splits.json` and prior assignments are never recomputed, so a second training round cannot place a past training item in the gate. Listed here rather than deleted, because an earlier version of this document told you it was broken. |
 | **Prompt-pool redistribution terms** | The pool is derived from AI-Hub 013. Its redistribution conditions have not been checked. Do not expose `/v1/enroll/next-prompts` on a public endpoint until that is settled. |
 

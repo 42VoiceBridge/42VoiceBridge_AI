@@ -62,6 +62,11 @@ for k in ("transcription_id", "request_id", "user_id", "revision", "status", "te
 check(t.get("alternatives") == [] and t.get("score") is None and t.get("score_type") is None,
       "v1: alternatives [] and score/score_type null")
 check(t["model"].get("adapter_id") is None, "guest -> no adapter")
+if not ADAPTER_USER:
+    # "0 failed" must not read as full coverage: this branch holds the only HTTP checks for the
+    # adapter path, and it is skipped unless a user with an active adapter is named on argv.
+    # test_activation.py covers the same ground against a running server (groups 2, 3, 8).
+    print("SKIP adapter-path checks: pass a user_id with an active adapter as argv[2]")
 if ADAPTER_USER:
     s, ta = call("POST", "/v1/asr/transcribe?user_id=%s" % ADAPTER_USER, tone, "audio/wav")
     check(ta["model"]["adapter_id"] is not None and ta["model"]["adapter_revision"], "adapter user gets own adapter")

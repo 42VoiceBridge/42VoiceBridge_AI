@@ -112,6 +112,7 @@ def parse_wav(data):
 class MockEngine:
     name = "mock"
     base_model, base_revision = "mock", "mock"
+    base_revision_source, base_revision_verified = "mock", True
 
     def __init__(self):
         self.adapters = {}
@@ -137,6 +138,29 @@ class MockEngine:
         return text.strip()
 
 
+def resolve_base_revision(model):
+    """(revision, source). Confirms the loaded base revision from the artifact where possible.
+
+    `config._commit_hash` is the direct answer but is absent on an offline cache load. The cache
+    stores each revision under `.../snapshots/<commit sha>/`, so resolving the config file we
+    loaded gives the same fact from the filesystem. Only if both fail do we report the requested
+    pin, and then `base_revision_verified` is false - the pin is what we ASKED for, not proof.
+    """
+    h = getattr(model.config, "_commit_hash", None)
+    if h:
+        return h, "config_commit_hash"
+    try:
+        from transformers.utils import cached_file
+        parts = cached_file(BASE, "config.json", revision=BASE_REVISION).split(os.sep)
+        i = parts.index("snapshots")
+        sha = parts[i + 1]
+        if re.fullmatch(r"[0-9a-f]{40}", sha):
+            return sha, "cache_snapshot_path"
+    except Exception:                                         # noqa: BLE001
+        pass
+    return BASE_REVISION, "requested_pin_unverified"
+
+
 class HFEngine:
     name = "transformers+peft"
 
@@ -153,10 +177,18 @@ class HFEngine:
         except Exception:                                     # noqa: BLE001
             pass
         self.base_model = BASE
-        self.base_revision = getattr(m.config, "_commit_hash", None)
         # D-5: the revision was recorded but never enforced, so the hub could have served a
         # different snapshot and every adapter trained against the pinned one would be mismatched.
-        if BASE_REVISION and self.base_revision not in (None, BASE_REVISION):
+        #
+        # 2026-10-03: the enforcement was weaker than it read. `config._commit_hash` is unset when
+        # the weights come from a local cache with HF_HUB_OFFLINE, and the check allowed None, so
+        # it passed vacuously and we reported `base_revision: null` to the backend - exactly the
+        # silent-base-switch they asked about (A1/A5). Confirm from the artifact instead of
+        # echoing the pin, and when it cannot be confirmed, say so in the field rather than
+        # printing the pin as though it had been checked.
+        self.base_revision, self.base_revision_source = resolve_base_revision(m)
+        self.base_revision_verified = self.base_revision_source != "requested_pin_unverified"
+        if BASE_REVISION and self.base_revision_verified and self.base_revision != BASE_REVISION:
             raise RuntimeError("base revision mismatch: loaded %s, pinned %s"
                                % (self.base_revision, BASE_REVISION))
         self.model = m.to(self.device).eval()
@@ -332,6 +364,8 @@ def syl_edit_distance(a, b):
 def core_health():
     return dict(status="ok", contract_version=CONTRACT_VERSION, engine=ENG.name,
                      base_model=ENG.base_model, base_revision=ENG.base_revision,
+                     base_revision_verified=ENG.base_revision_verified,
+                     base_revision_source=ENG.base_revision_source,
                      preprocessing_version=PREPROC_VERSION, beam_size=BEAMS,
                      generation=decoding.describe(),
                      adapters=[dict(adapter_id=m["adapter_id"], user_id=m["user_id"],
@@ -374,6 +408,7 @@ def core_transcribe(audio_wav, user_id, use_adapter=True, request_id=None):
         request_id=request_id, user_id=user_id, revision=1, status=status, text=text,
         alternatives=[], score=None, score_type=None,
         model=dict(engine=ENG.name, base_model=ENG.base_model, base_revision=ENG.base_revision,
+                   base_revision_verified=ENG.base_revision_verified,
                    adapter_id=ad["adapter_id"] if ad else None,
                    adapter_revision=ad["adapter_revision"] if ad else None,
                    # A5: why the base ran, when it ran. null when an adapter ran.
