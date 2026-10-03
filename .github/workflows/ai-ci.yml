@@ -4,6 +4,11 @@ name: AI CI and image
 # same sha-<commit> + branch tagging, verify-then-publish, digest in the step summary. The backend
 # asked for one build/deploy pass, so Infra should be able to pull both images the same way.
 #
+# Verified 2026-10-03 by building this image locally (arm64) and running every step below against
+# it: identity/deps/no-derived-data, mock boot + health contract, and - beyond what CI does - the
+# real engine with an HF cache mounted at /data/hf. CI builds linux/amd64; the CPU index carries
+# torch 2.14.1+cpu wheels for both manylinux_2_28_x86_64 and aarch64.
+#
 # WHAT THIS PROVES, AND WHAT IT DOES NOT.
 # Every suite here runs on the MOCK engine or on stubs. That is deliberate: CI can check the
 # contract, the job state machine, split disjointness and adapter activation without a 1 GB model

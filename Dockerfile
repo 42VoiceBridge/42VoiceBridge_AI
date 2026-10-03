@@ -7,6 +7,9 @@
 #   - the prompt pool     derived from AI-Hub 013, whose redistribution conditions are unchecked
 #   - adapters            LoRA weights trained on AI-Hub audio, i.e. derived data
 # A published image is a distribution channel. None of the above may travel in one.
+# Built and run 2026-10-03: 1.61 GB, builds in ~2.5 min, boots with ASR_ENGINE=mock, and serves
+# the REAL engine when an HF cache is mounted at /data/hf (base_revision confirmed
+# 973afd24..., source cache_snapshot_path; first transcribe 3.9 s inside the container).
 FROM python:3.11-slim-bookworm
 
 # Versions measured working together 2026-10-03 (macOS arm64 + this image): the serving path and
