@@ -29,6 +29,8 @@ os.environ.setdefault("ASR_ENGINE", "mock")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import server  # noqa: E402
 
+TMPD = __import__("tempfile").mkdtemp(prefix="core_")
+
 
 def wav(seconds=1.0, amp=8000):
     buf = io.BytesIO()
@@ -208,8 +210,18 @@ def main():
     # ---- enrollment ingest (backend T3/T4, 2026-10-03) -----------------------------------
     import base64
     import train_worker
-    pid = server.pool_items()[0][0]
-    pid2 = server.pool_items()[1][0]
+    # The real prompt pool is AI-Hub derived and is never in this repo, so the test brings its own.
+    # CI caught this: these checks passed on my machine only because my working tree had the real
+    # data/script_pool.json, which the repository must never contain.
+    import make_prompt_fixture
+    _pool = os.path.join(TMPD, "pool.json")
+    json.dump(make_prompt_fixture.build(), open(_pool, "w", encoding="utf-8"), ensure_ascii=False)
+    server.POOL, server.POOL_ITEMS = _pool, None
+    items = server.pool_items()
+    assert len(items) == 36 and all(k[:5] in ("02-03", "02-04", "06-01") for k, _ in items), \
+        "pool_items must select on the task code"
+    pid = items[0][0]
+    pid2 = items[1][0]
     u = "ingest_u1"
     ed = os.path.join(train_worker.ENROLL_DIR, u)
     if os.path.isdir(ed):

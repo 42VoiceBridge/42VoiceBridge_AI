@@ -66,7 +66,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 demo/server.py & server_pid=$!
+          # The real prompt pool is AI-Hub derived and is never in this repo, so the server gets a
+          # synthetic one. Without it /v1/enroll/next-prompts is 503 and the enrollment checks
+          # cannot run - which is exactly how the first CI run failed.
+          python3 demo/make_prompt_fixture.py "$RUNNER_TEMP/pool.json"
+          PROMPT_POOL="$RUNNER_TEMP/pool.json" python3 demo/server.py & server_pid=$!
           trap 'kill "$server_pid" 2>/dev/null || true' EXIT
           for _ in $(seq 1 30); do
             curl -fsS http://127.0.0.1:8000/v1/health >/dev/null 2>&1 && break
