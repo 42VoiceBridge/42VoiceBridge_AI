@@ -1,0 +1,148 @@
+name: AI CI and image
+
+# Mirrors 42VoiceBridge_BE/.github/workflows/backend-ci.yml on purpose: same runner, same registry,
+# same sha-<commit> + branch tagging, verify-then-publish, digest in the step summary. The backend
+# asked for one build/deploy pass, so Infra should be able to pull both images the same way.
+#
+# WHAT THIS PROVES, AND WHAT IT DOES NOT.
+# Every suite here runs on the MOCK engine or on stubs. That is deliberate: CI can check the
+# contract, the job state machine, split disjointness and adapter activation without a 1 GB model
+# download. It CANNOT check recognition quality, and a green run is not model evidence. Accuracy
+# numbers come only from the GPU runs recorded in the AI handoff, with their own caveats.
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ai-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      IMAGE: ghcr.io/42voicebridge/42voicebridge_ai
+      ASR_ENGINE: mock
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install test dependencies
+        # The mock engine needs numpy alone. torch/transformers/peft are installed in the image,
+        # not here, so the suites stay a few seconds instead of a few minutes.
+        run: pip install --no-cache-dir numpy
+
+      - name: Contract functions (no HTTP, no model)
+        run: python3 demo/test_core.py
+
+      - name: Promotion gate and split membership (trainer and gate stubbed)
+        run: python3 demo/test_train_worker.py
+
+      - name: Adapter activation against a running server
+        # Starts its own server subprocess on ACTIVATION_PORT and writes adapters from outside it.
+        run: python3 demo/test_activation.py
+
+      - name: HTTP contract against a running server
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 demo/server.py & server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8000/v1/health >/dev/null 2>&1 && break
+            sleep 1
+          done
+          python3 demo/test_contract.py http://127.0.0.1:8000
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image for verification
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          push: false
+          platforms: linux/amd64
+          tags: ${{ env.IMAGE }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Verify the image serves the contract and carries no derived data
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="$IMAGE:sha-$GITHUB_SHA"
+
+          # AI-Hub audio, labels and anything derived from them must never travel in an image.
+          docker run --rm --entrypoint sh "$image" -ec '
+            test "$(id -u)" = 10001
+            test -r /app/server.py
+            python3 -c "import torch, transformers, peft, numpy"
+            found=$(find /app /data \( -name "*.wav" -o -name "*.safetensors" -o -name "*_manifest.json" -o -name "script_pool.json" \) 2>/dev/null | head -5)
+            test -z "$found" || { echo "derived data in the image: $found" >&2; exit 1; }
+          '
+
+          # The mock engine boots with no weights, so this checks the contract, not recognition.
+          cid=$(docker run -d -p 8000:8000 -e ASR_ENGINE=mock "$image")
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8000/v1/health >/dev/null 2>&1 && break
+            sleep 1
+          done
+          health=$(curl -fsS http://127.0.0.1:8000/v1/health)
+          echo "$health"
+          python3 - "$health" <<'PY'
+          import json, sys
+          h = json.loads(sys.argv[1])
+          assert h["contract_version"] == "ai-contract-v1", h
+          g = h["generation"]
+          assert g["generation_version"] == "gen-v1", g
+          assert g["num_beams"] == 1 and g["do_sample"] is False, g
+          assert h["engine"] == "mock", "verification must not be read as real-engine evidence"
+          print("health contract ok")
+          PY
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish verified image and record digest
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="$IMAGE:sha-$GITHUB_SHA"
+          docker push "$image"
+          docker tag "$image" "$IMAGE:$GITHUB_REF_NAME"
+          docker push "$IMAGE:$GITHUB_REF_NAME"
+          digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$image")
+          test -n "$digest"
+          {
+            echo "### Deployable AI image"
+            echo "\`$digest\`"
+            echo ""
+            echo "Mount at runtime, never baked in: \`/data/script_pool.json\` (prompt pool),"
+            echo "\`/data/adapters\` (LoRA weights), \`/data/hf\` (model cache)."
+            echo "Suites in this run used the **mock** engine: contract and lifecycle only, not recognition."
+          } >> "$GITHUB_STEP_SUMMARY"

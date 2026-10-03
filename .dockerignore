@@ -1,0 +1,25 @@
+# The build context is the repo root. Keep AI-Hub audio, labels and derived data out of the image
+# even when a developer builds from a working tree that has them (the repo's .gitignore stops them
+# reaching git; this stops them reaching an image, which is also a distribution channel).
+**/.venv
+**/__pycache__
+**/*.pyc
+**/*.wav
+**/*.mp3
+**/*.m4a
+**/*.safetensors
+**/*.pt
+**/*.bin
+**/*_manifest.json
+**/hyp*.json
+**/script_pool.json
+demo/samples
+demo/adapters
+demo/enroll
+demo/jobs
+data
+experiments
+docs
+.git
+.github
+*.md

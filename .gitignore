@@ -8,6 +8,9 @@
 # --- allowed: repo meta
 !.gitignore
 !README.md
+!.dockerignore
+!Dockerfile
+!.github/workflows/*.yml
 
 # --- allowed: demo AI server (contract v1 reference implementation)
 !demo/*.py
