@@ -134,6 +134,74 @@ paths:
                         prompt_id: {type: string}
                         text: {type: string}
         "501": {$ref: "#/components/responses/Error"}
+  /v1/enroll/recordings:
+    post:
+      summary: >
+        Deliver one enrollment recording (backend T3). Raw WAV body, same framing and the same
+        audio limits as /v1/asr/transcribe. Re-sending a prompt_id REPLACES that take - two
+        recordings of one sentence cannot be split into train and gate.
+      description: >
+        The training label is NEVER taken from the request body. It is the canonical text of
+        prompt_id in the pinned pool, so a recommended sentence cannot become a label by
+        accident (backend T4). text_b64 supplies a human-reviewed transcript of what the user
+        actually read; only then is the item reviewed, and /v1/adapters/train refuses
+        unreviewed items unless ASR_ALLOW_UNREVIEWED is set.
+      parameters:
+        - {in: query, name: user_id, required: true, schema: {type: string, pattern: "^[A-Za-z0-9._-]{1,128}$"}}
+        - {in: query, name: prompt_id, required: true, schema: {type: string}}
+        - in: query
+          name: text_b64
+          required: false
+          schema: {type: string}
+          description: >
+            base64url of the UTF-8 reviewed transcript. Sent as a query value, not a path or a
+            log line: the server strips the query string before logging.
+      requestBody:
+        required: true
+        content:
+          audio/wav: {schema: {type: string, format: binary}}
+      responses:
+        "201":
+          description: Stored
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/EnrollItemAccepted"}
+        "400": {$ref: "#/components/responses/Error"}
+        "404":
+          description: unknown_prompt_id - not in the pinned pool.
+          content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+        "413": {$ref: "#/components/responses/Error"}
+        "415": {$ref: "#/components/responses/Error"}
+        "422": {$ref: "#/components/responses/Error"}
+    get:
+      summary: Enrollment counts and per-item provenance for one user. Returns no label text.
+      parameters:
+        - {in: query, name: user_id, required: true, schema: {type: string}}
+      responses:
+        "200":
+          description: Enrollment state
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/EnrollList"}
+        "400": {$ref: "#/components/responses/Error"}
+    delete:
+      summary: >
+        Consent withdrawal for one recording: the audio file and its pair entry are both
+        removed. Adapters already trained from it are NOT retired - that is a separate
+        decision (backend T9), and the response states it.
+      parameters:
+        - {in: query, name: user_id, required: true, schema: {type: string}}
+        - {in: query, name: prompt_id, required: true, schema: {type: string}}
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/EnrollDeleted"}
+        "400": {$ref: "#/components/responses/Error"}
+        "404":
+          description: unknown_prompt_id - this user has no recording for that prompt.
+          content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
   /v1/adapters/train:
     post:
       summary: >
@@ -153,9 +221,14 @@ paths:
             application/json:
               schema: {$ref: "#/components/schemas/Job"}
         "400": {$ref: "#/components/responses/Error"}
+        "409":
+          description: >
+            enrollment_unreviewed - one or more recordings have no human-reviewed transcript.
+            Carries unreviewed_prompt_ids and n_unreviewed.
+          content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
         "404":
           description: >
-            no_enrollment - no pairs.json for this user. The error carries expected_path.
+            no_enrollment - no recordings for this user. The error carries expected_path.
           content:
             application/json:
               schema: {$ref: "#/components/schemas/Error"}
@@ -196,6 +269,70 @@ components:
                   message: {type: string}
                 additionalProperties: true
   schemas:
+    EnrollCounts:
+      type: object
+      properties:
+        n_enrolled: {type: integer}
+        n_unreviewed:
+          type: integer
+          description: Items whose label is the prompt text rather than a reviewed transcript.
+        min_enroll:
+          type: integer
+          description: Policy, not evidence. The minimum enrollment count was never measured.
+        min_gate: {type: integer}
+        trainable:
+          type: boolean
+          description: Whether POST /v1/adapters/train would be accepted right now.
+    EnrollItem:
+      type: object
+      properties:
+        file: {type: string}
+        prompt_id: {type: string}
+        text_source:
+          type: string
+          enum: [prompt_pool, reviewed_transcript, manifest]
+        reviewed: {type: boolean}
+        audio_sha256: {type: string}
+        duration_sec: {type: number}
+        dbfs: {type: number}
+        created_at: {type: string}
+        text:
+          type: string
+          description: Present only in the ingest response, so the caller can see what was stored.
+    EnrollItemAccepted:
+      allOf:
+        - $ref: "#/components/schemas/EnrollCounts"
+        - type: object
+          properties:
+            contract_version: {type: string}
+            user_id: {type: string}
+            item: {$ref: "#/components/schemas/EnrollItem"}
+            replaced_previous_take: {type: boolean}
+            pool_version: {type: string}
+            pool_sha256: {type: string}
+    EnrollList:
+      allOf:
+        - $ref: "#/components/schemas/EnrollCounts"
+        - type: object
+          properties:
+            contract_version: {type: string}
+            user_id: {type: string}
+            items:
+              type: array
+              items: {$ref: "#/components/schemas/EnrollItem"}
+    EnrollDeleted:
+      allOf:
+        - $ref: "#/components/schemas/EnrollCounts"
+        - type: object
+          properties:
+            contract_version: {type: string}
+            user_id: {type: string}
+            deleted_prompt_id: {type: string}
+            audio_deleted: {type: boolean}
+            adapters_retired:
+              type: boolean
+              description: Always false in v1. Retiring an adapter is a separate decision.
+            note: {type: string}
     Error:
       type: object
       properties:

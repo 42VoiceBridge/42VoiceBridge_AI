@@ -117,5 +117,50 @@ s2, p2 = call("POST", "/v1/enroll/next-prompts", {"user_id": "u", "n": 3, "seed"
 check(s == 200 and len(p["prompts"]) == 3 and p["prompts"] == p2["prompts"], "prompts: n honoured, seeded")
 s, e = call("POST", "/v1/enroll/next-prompts", {"user_id": "u", "strategy": "error_based"})
 check(s == 501, "error_based strategy is 501, not faked")
+# ---- enrollment ingest over HTTP (backend T3, 2026-10-03) -------------------------------
+import base64 as _b64
+EU = "ct_" + RUN
+_pid = p["prompts"][0]["prompt_id"]
+_pid2 = p["prompts"][1]["prompt_id"]
+s, r = call("POST", "/v1/enroll/recordings?user_id=%s&prompt_id=%s" % (EU, _pid),
+            wav(1.0), "audio/wav")
+check(s == 201 and r["n_enrolled"] == 1 and r["item"]["reviewed"] is False,
+      "ingest: 201, label from the prompt pool, not reviewed")
+check(r["item"]["text"] == p["prompts"][0]["text"] and r["item"]["text_source"] == "prompt_pool",
+      "ingest: the label is the pool text for that prompt_id, and says so")
+s, r2 = call("POST", "/v1/enroll/recordings?user_id=%s&prompt_id=%s&text_b64=%s"
+             % (EU, _pid2, _b64.urlsafe_b64encode("읽은 문장".encode()).decode().rstrip("=")),
+             wav(1.0), "audio/wav")
+check(s == 201 and r2["item"]["text"] == "읽은 문장" and r2["item"]["reviewed"] is True,
+      "ingest: a reviewed transcript overrides the prompt text and marks itself reviewed")
+s, r3 = call("POST", "/v1/enroll/recordings?user_id=%s&prompt_id=%s" % (EU, _pid),
+             wav(1.3), "audio/wav")
+check(s == 201 and r3["replaced_previous_take"] is True and r3["n_enrolled"] == 2,
+      "ingest: re-recording a prompt replaces the take instead of duplicating the sentence")
+s, li = call("GET", "/v1/enroll/recordings?user_id=%s" % EU)
+check(s == 200 and li["n_enrolled"] == 2 and all("text" not in i for i in li["items"]),
+      "enroll list: counts and provenance, no label text")
+s, e = call("POST", "/v1/adapters/train?user_id=%s" % EU)
+check(s == 409 and e["error"]["code"] == "enrollment_unreviewed",
+      "train refuses while any recording has no reviewed transcript")
+s, e = call("POST", "/v1/enroll/recordings?user_id=%s&prompt_id=99-99-nope" % EU,
+            wav(1.0), "audio/wav")
+check(s == 404 and e["error"]["code"] == "unknown_prompt_id", "ingest: prompt must be in the pool")
+s, e = call("POST", "/v1/enroll/recordings?user_id=%s/../x&prompt_id=%s" % (EU, _pid),
+            wav(1.0), "audio/wav")
+check(s == 400 and e["error"]["code"] == "bad_user_id", "ingest: path traversal in user_id refused")
+s, e = call("POST", "/v1/enroll/recordings?user_id=%s&prompt_id=%s" % (EU, _pid),
+            wav(1.0, rate=44100), "audio/wav")
+check(s == 422 and e["error"]["code"] == "bad_audio_format",
+      "ingest: same audio limits as transcribe")
+s, d1 = call("DELETE", "/v1/enroll/recordings?user_id=%s&prompt_id=%s" % (EU, _pid))
+check(s == 200 and d1["audio_deleted"] is True and d1["adapters_retired"] is False
+      and d1["n_enrolled"] == 1,
+      "delete: audio and pair entry go; the response says adapters are NOT retired")
+s, d2 = call("DELETE", "/v1/enroll/recordings?user_id=%s&prompt_id=%s" % (EU, _pid))
+check(s == 404 and d2["error"]["code"] == "unknown_prompt_id", "delete is not idempotently silent")
+s, d3 = call("DELETE", "/v1/enroll/recordings?user_id=%s&prompt_id=%s" % (EU, _pid2))
+check(s == 200 and d3["n_enrolled"] == 0, "delete: last recording removed")
+
 print("\n%d failed" % len(FAIL))
 sys.exit(1 if FAIL else 0)

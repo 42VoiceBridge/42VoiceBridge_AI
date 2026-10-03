@@ -21,10 +21,12 @@ Scope of v1, stated so nobody builds on more than exists:
   - Inference is serialized with a lock: the PEFT model holds one active adapter at a time,
     so concurrent requests for different users must not interleave.
 """
+import base64
 import hashlib
 import json
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -499,16 +501,13 @@ def h_jamo(q, body):
     return 200, out
 
 
-def h_prompts(q, body):
-    global POOL_ITEMS
-    try:
-        req = json.loads(body or b"{}")
-    except ValueError:
-        raise ApiError(400, "bad_json", "body must be JSON")
-    strat = req.get("strategy", "random")
-    if strat != "random":
-        raise ApiError(501, "strategy_not_implemented",
-                       "v1 implements 'random' only; 'coverage' and 'error_based' are planned")
+def pool_items():
+    """[(prompt_id, text)] from the pinned prompt pool, loaded once. Also fills POOL_SHA.
+
+    Shared by /v1/enroll/next-prompts and enrollment ingest so a recording can never be
+    labelled from a different pool than the one the prompt was recommended from.
+    """
+    global POOL_ITEMS, POOL_SHA
     if POOL_ITEMS is None:
         if not os.path.isfile(POOL):
             raise ApiError(503, "prompt_pool_missing", "script_pool.json not found", path=POOL)
@@ -518,9 +517,21 @@ def h_prompts(q, body):
         # R5 (backend, 2026-10-03): the same seed can return different prompts if the pool changes.
         # This hashes the SELECTED items, so it identifies what recommendations are drawn from -
         # deliberately not the strategy version, which identifies the algorithm.
-        global POOL_SHA
         POOL_SHA = hashlib.sha256(
             "\n".join("%s\t%s" % kv for kv in POOL_ITEMS).encode("utf-8")).hexdigest()[:16]
+    return POOL_ITEMS
+
+
+def h_prompts(q, body):
+    try:
+        req = json.loads(body or b"{}")
+    except ValueError:
+        raise ApiError(400, "bad_json", "body must be JSON")
+    strat = req.get("strategy", "random")
+    if strat != "random":
+        raise ApiError(501, "strategy_not_implemented",
+                       "v1 implements 'random' only; 'coverage' and 'error_based' are planned")
+    pool_items()
     excl = set(req.get("exclude_prompt_ids") or [])
     cand = [kv for kv in POOL_ITEMS if kv[0] not in excl]
     n = max(1, min(int(req.get("n", 10)), 50))
@@ -533,18 +544,173 @@ def h_prompts(q, body):
                      prompts=[dict(prompt_id=k, text=v) for k, v in pick])
 
 
+# ------------------------------------------------------------------ enrollment ingest
+# Backend question T3 (2026-10-02): the training worker reads
+# demo/enroll/<user_id>/{pairs.json,*.wav} off local disk, so until this existed the backend had
+# no way to deliver recordings at all and /v1/adapters/train was unreachable for them.
+#
+# Shape chosen: the backend PUSHES one recording per call, raw WAV body, same framing as
+# /v1/asr/transcribe. The alternative (we PULL from their storage by key or presigned URL) avoids
+# a second copy of user audio and is the better production shape; it needs credentials or signed
+# URLs we do not have, so it is not built. Said plainly to the backend rather than assumed.
+#
+# The label never comes from the request. It is the canonical text of the prompt that was
+# recommended, looked up in the pinned pool - their T4 asks for exactly this, because a
+# recommended sentence or a confirmation string must not become a training label by accident.
+# A human-reviewed transcript may override it (text_b64), and only then is the item `reviewed`.
+UNREVIEWED_OK = os.environ.get("ASR_ALLOW_UNREVIEWED", "") not in ("", "0", "false", "False")
+
+
+def safe_id(v, what):
+    """Path components come from the network. Anything but [A-Za-z0-9._-] is refused."""
+    v = (v or "").strip()
+    if not v:
+        raise ApiError(400, "missing_" + what, "%s is required" % what)
+    if len(v) > 128 or not re.fullmatch(r"[A-Za-z0-9._-]+", v) or v.startswith("."):
+        raise ApiError(400, "bad_" + what, "%s must match [A-Za-z0-9._-]{1,128}" % what)
+    return v
+
+
+def enroll_dir(user_id, make=False):
+    import train_worker
+    d = os.path.join(train_worker.ENROLL_DIR, safe_id(user_id, "user_id"))
+    if make:
+        os.makedirs(d, exist_ok=True)
+    return d
+
+
+def read_pairs(d):
+    p = os.path.join(d, "pairs.json")
+    if not os.path.isfile(p):
+        return []
+    v = json.load(open(p, encoding="utf-8"))
+    return v.get("pairs", v) if isinstance(v, dict) else v
+
+
+def write_pairs(d, items):
+    p = os.path.join(d, "pairs.json")
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(dict(pairs=items), f, ensure_ascii=False, indent=1)
+    os.replace(tmp, p)                      # atomic: the worker never reads a half-written list
+
+
+def core_enroll_put(user_id, prompt_id, wav, text_b64=None):
+    """Store one enrollment recording. Re-recording the same prompt REPLACES the old take."""
+    d = enroll_dir(user_id, make=True)
+    pid = safe_id(prompt_id, "prompt_id")
+    text = dict(pool_items()).get(pid)
+    if text is None:
+        raise ApiError(404, "unknown_prompt_id",
+                       "not in the pinned prompt pool; recommend prompts via "
+                       "/v1/enroll/next-prompts and send back the prompt_id you showed",
+                       pool_version=POOL_VERSION, pool_sha256=POOL_SHA)
+    source, reviewed = "prompt_pool", False
+    if text_b64:
+        try:
+            text = base64.urlsafe_b64decode(text_b64 + "=" * (-len(text_b64) % 4)).decode("utf-8")
+        except Exception as e:                                       # noqa: BLE001
+            raise ApiError(400, "bad_text_b64", "text_b64 must be base64url of UTF-8: %s" % e)
+        if not text.strip():
+            raise ApiError(422, "empty_text", "reviewed transcript is empty")
+        source, reviewed = "reviewed_transcript", True
+
+    _, dur, dbfs = parse_wav(wav)           # same limits as transcribe: PCM16 mono 16k, 0.3-30 s
+    name = "e_%s.wav" % sha256(pid.encode())[:12]
+    with open(os.path.join(d, name + ".tmp"), "wb") as f:
+        f.write(wav)
+    os.replace(os.path.join(d, name + ".tmp"), os.path.join(d, name))
+
+    item = dict(file=name, text=text.strip(), prompt_id=pid, text_source=source,
+                reviewed=reviewed, audio_sha256=sha256(wav), bytes=len(wav),
+                duration_sec=round(dur, 3), dbfs=dbfs,
+                created_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+    items = [x for x in read_pairs(d) if x.get("prompt_id") != pid]
+    replaced = len(read_pairs(d)) - len(items)
+    items.append(item)
+    write_pairs(d, items)
+
+    import train_worker
+    return dict(contract_version=CONTRACT_VERSION, user_id=user_id, item=item,
+                replaced_previous_take=bool(replaced),
+                pool_version=POOL_VERSION, pool_sha256=POOL_SHA,
+                **enroll_counts(items, train_worker))
+
+
+def enroll_counts(items, tw):
+    n = len(items)
+    unrev = sum(1 for x in items if not x.get("reviewed", True))
+    return dict(n_enrolled=n, n_unreviewed=unrev,
+                min_enroll=tw.MIN_ENROLL, min_gate=tw.MIN_GATE,
+                trainable=n >= tw.MIN_ENROLL and (unrev == 0 or UNREVIEWED_OK))
+
+
+def core_enroll_list(user_id):
+    """Counts and per-item provenance. Deliberately returns no label text."""
+    import train_worker
+    items = read_pairs(enroll_dir(user_id))
+    return dict(contract_version=CONTRACT_VERSION, user_id=user_id,
+                items=[dict(prompt_id=x.get("prompt_id"), file=x["file"],
+                            text_source=x.get("text_source", "manifest"),
+                            reviewed=x.get("reviewed", True),
+                            audio_sha256=x.get("audio_sha256"),
+                            duration_sec=x.get("duration_sec"),
+                            created_at=x.get("created_at")) for x in items],
+                **enroll_counts(items, train_worker))
+
+
+def core_enroll_delete(user_id, prompt_id):
+    """Consent withdrawal for one recording: the audio file AND its pair entry both go.
+
+    Adapters already trained from it are NOT retired by this call - that is a separate decision
+    (backend T9). The response says so rather than letting the caller assume it was handled.
+    """
+    import train_worker
+    d = enroll_dir(user_id)
+    pid = safe_id(prompt_id, "prompt_id")
+    items = read_pairs(d)
+    keep = [x for x in items if x.get("prompt_id") != pid]
+    if len(keep) == len(items):
+        raise ApiError(404, "unknown_prompt_id", "this user has no recording for that prompt_id")
+    for x in items:
+        if x.get("prompt_id") == pid:
+            try:
+                os.remove(os.path.join(d, x["file"]))
+            except FileNotFoundError:
+                pass
+    write_pairs(d, keep)
+    return dict(contract_version=CONTRACT_VERSION, user_id=user_id, deleted_prompt_id=pid,
+                audio_deleted=True, adapters_retired=False,
+                note="existing adapters trained from this recording are not retired by this call",
+                **enroll_counts(keep, train_worker))
+
+
 def core_train(user_id):
     """Queue a per-user adapter run. Promotion is decided by train_worker's held-out gate."""
     user_id = (user_id or "").strip()
     if not user_id:
         raise ApiError(400, "missing_user_id", "user_id is required")
     import train_worker
-    d = os.path.join(train_worker.ENROLL_DIR, user_id)
+    d = enroll_dir(user_id)
     if not os.path.isfile(os.path.join(d, "pairs.json")):
         raise ApiError(404, "no_enrollment",
-                       "no enrollment for this user; upload pairs.json and the audio first",
+                       "no enrollment for this user; POST recordings to "
+                       "/v1/enroll/recordings first",
                        expected_path=os.path.join(d, "pairs.json"))
+    items = read_pairs(d)
+    unrev = [x.get("prompt_id") for x in items if not x.get("reviewed", True)]
+    # Backend T4: a recommended sentence is what the user was ASKED to say, not what they said.
+    # Training on it teaches the model a reading it may never have produced. Items ingested
+    # without a reviewed transcript are refused by default; the override exists so integration
+    # can be tested before a review UI exists, and it is reported in the response.
+    if unrev and not UNREVIEWED_OK:
+        raise ApiError(409, "enrollment_unreviewed",
+                       "%d of %d recordings have no human-reviewed transcript; send text_b64 on "
+                       "ingest, or set ASR_ALLOW_UNREVIEWED=1 to train on prompt text anyway"
+                       % (len(unrev), len(items)),
+                       unreviewed_prompt_ids=unrev[:20], n_unreviewed=len(unrev))
     job = train_worker.submit(user_id)
+    job["trained_on_unreviewed"] = bool(unrev)
     job["contract_version"] = CONTRACT_VERSION
     return job
 
@@ -631,6 +797,11 @@ class H(BaseHTTPRequestHandler):
                 return self._send(200, open(fp, "rb").read(), ctype)
             if method == "GET" and p == "/v1/health":
                 return self._send(*h_health(q, None))
+            if method == "GET" and p == "/v1/enroll/recordings":
+                return self._send(200, core_enroll_list((q.get("user_id") or [""])[0]))
+            if method == "DELETE" and p == "/v1/enroll/recordings":
+                return self._send(200, core_enroll_delete(
+                    (q.get("user_id") or [""])[0], (q.get("prompt_id") or [""])[0]))
             body = self._body()
             if method == "POST" and p == "/v1/asr/transcribe":
                 return self._send(*h_transcribe(q, body))
@@ -646,6 +817,10 @@ class H(BaseHTTPRequestHandler):
                 return self._send(*h_job(p.split("/")[3]))
             if method == "POST" and p == "/v1/adapters/train":
                 return self._send(*h_train(q, body))
+            if method == "POST" and p == "/v1/enroll/recordings":
+                return self._send(201, core_enroll_put(
+                    (q.get("user_id") or [""])[0], (q.get("prompt_id") or [""])[0], body,
+                    (q.get("text_b64") or [None])[0]))
             raise ApiError(404, "not_found", "no route %s %s" % (method, p))
         except ApiError as e:
             return self._send(e.http, dict(contract_version=CONTRACT_VERSION,
@@ -659,8 +834,13 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         self._route("POST")
 
+    def do_DELETE(self):
+        self._route("DELETE")
+
     def log_message(self, fmt, *args):
-        sys.stderr.write("%s %s\n" % (time.strftime("%H:%M:%S"), fmt % args))
+        # the query string can carry a transcript (text_b64); keep it out of the log
+        line = (fmt % args).split("?")[0]
+        sys.stderr.write("%s %s\n" % (time.strftime("%H:%M:%S"), line))
 
 
 def main():

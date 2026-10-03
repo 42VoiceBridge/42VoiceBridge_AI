@@ -205,6 +205,91 @@ def main():
     assert server.h_jamo({}, body)[1]["contract_version"] == server.CONTRACT_VERSION
     ok += 1
 
+    # ---- enrollment ingest (backend T3/T4, 2026-10-03) -----------------------------------
+    import base64
+    import train_worker
+    pid = server.pool_items()[0][0]
+    pid2 = server.pool_items()[1][0]
+    u = "ingest_u1"
+    ed = os.path.join(train_worker.ENROLL_DIR, u)
+    if os.path.isdir(ed):
+        _sh.rmtree(ed)
+
+    r = server.core_enroll_put(u, pid, wav(1.0))
+    assert r["item"]["text"] == dict(server.pool_items())[pid], "label must be the pool text"
+    assert r["item"]["text_source"] == "prompt_pool" and r["item"]["reviewed"] is False
+    assert r["n_enrolled"] == 1 and r["n_unreviewed"] == 1 and r["trainable"] is False
+    assert r["item"]["audio_sha256"] == server.sha256(wav(1.0))
+    ok += 1
+
+    # the request body cannot set the label; only a reviewed transcript can, and it marks itself
+    said = "제가 실제로 읽은 문장"
+    r2 = server.core_enroll_put(u, pid2, wav(1.0),
+                                base64.urlsafe_b64encode(said.encode()).decode().rstrip("="))
+    assert r2["item"]["text"] == said and r2["item"]["reviewed"] is True
+    assert r2["item"]["text_source"] == "reviewed_transcript"
+    assert r2["n_enrolled"] == 2 and r2["n_unreviewed"] == 1
+    ok += 1
+
+    # re-recording the same prompt REPLACES the take; it must not create a duplicate sentence,
+    # which load_pairs refuses (the gate cannot hold a sentence out from itself)
+    r3 = server.core_enroll_put(u, pid, wav(1.2))
+    assert r3["replaced_previous_take"] is True and r3["n_enrolled"] == 2
+    files = os.listdir(ed)
+    assert sum(1 for f in files if f.endswith(".wav")) == 2, files
+    assert not any(f.endswith(".tmp") for f in files), files
+    ok += 1
+
+    # unknown prompt, unparseable transcript, non-16k audio, and path traversal all refuse
+    for call, code in (
+            (lambda: server.core_enroll_put(u, "99-99-nope", wav()), "unknown_prompt_id"),
+            (lambda: server.core_enroll_put(u, pid, wav(), "!!!not base64!!!"), "bad_text_b64"),
+            (lambda: server.core_enroll_put(u, pid, b"not a wav at all"), "unsupported_media_type"),
+            (lambda: server.core_enroll_put(u, pid, wav(0.1)), "audio_too_short"),
+            (lambda: server.core_enroll_put("../../etc", pid, wav()), "bad_user_id"),
+            (lambda: server.core_enroll_put(u, "../../etc/passwd", wav()), "bad_prompt_id"),
+            (lambda: server.core_enroll_list(""), "missing_user_id")):
+        try:
+            call()
+            raise AssertionError("expected %s" % code)
+        except server.ApiError as e:
+            assert e.code == code, (e.code, code)
+    ok += 1
+
+    # train refuses while any item is unreviewed, and names them
+    try:
+        server.core_train(u)
+        raise AssertionError("expected enrollment_unreviewed")
+    except server.ApiError as e:
+        assert e.code == "enrollment_unreviewed" and e.http == 409, (e.code, e.http)
+        assert e.detail["unreviewed_prompt_ids"] == [pid], e.detail
+    ok += 1
+
+    # list returns provenance but never the label text
+    li = server.core_enroll_list(u)
+    assert len(li["items"]) == 2 and all("text" not in i for i in li["items"]), li
+    assert {i["prompt_id"] for i in li["items"]} == {pid, pid2}
+    ok += 1
+
+    # consent withdrawal removes the audio AND the pair entry, and says adapters are not retired
+    dl = server.core_enroll_delete(u, pid)
+    assert dl["audio_deleted"] is True and dl["adapters_retired"] is False
+    assert dl["n_enrolled"] == 1 and dl["n_unreviewed"] == 0
+    assert sum(1 for f in os.listdir(ed) if f.endswith(".wav")) == 1
+    assert server.read_pairs(ed)[0]["prompt_id"] == pid2
+    try:
+        server.core_enroll_delete(u, pid)
+        raise AssertionError("expected unknown_prompt_id on second delete")
+    except server.ApiError as e:
+        assert e.code == "unknown_prompt_id"
+    ok += 1
+
+    # what the worker will actually read back: file present, text non-empty, no duplicates
+    got = train_worker.load_pairs(u)
+    assert len(got) == 1 and got[0]["text"] == said and os.path.isfile(got[0]["path"])
+    ok += 1
+    _sh.rmtree(ed)
+
     print("core contract checks passed (%d groups)" % ok)
 
 
