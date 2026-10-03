@@ -100,6 +100,9 @@ def main():
     ap.add_argument("--n", default="all", help="enrollment budget in sentences, or 'all'")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--base", default="openai/whisper-small")
+    # 2026-09-26 (GPT review): the base was loaded by NAME, so the recorded revision was only
+    # whatever the hub happened to serve. eval_longform.py pins the same hash; keep them equal.
+    ap.add_argument("--base-revision", default="973afd24965f72e36ca33b3055d56a652f456b4d")
     ap.add_argument("--rank", type=int, default=32)
     ap.add_argument("--alpha", type=int, default=64)
     ap.add_argument("--targets", default="q_proj,v_proj")
@@ -158,9 +161,11 @@ def main():
     for x in enroll + devset + test:
         audio[x["seg_id"]] = read_wav(os.path.join(a.segdir, x["file"]))
 
-    proc = WhisperProcessor.from_pretrained(a.base, language="korean", task="transcribe")
-    model = WhisperForConditionalGeneration.from_pretrained(a.base).to(dev)
+    proc = WhisperProcessor.from_pretrained(a.base, revision=a.base_revision,
+                                            language="korean", task="transcribe")
+    model = WhisperForConditionalGeneration.from_pretrained(a.base, revision=a.base_revision).to(dev)
     base_rev = getattr(model.config, "_commit_hash", None)
+    assert base_rev in (None, a.base_revision), (base_rev, a.base_revision)
     try:
         model.generation_config.forced_decoder_ids = None
     except Exception:

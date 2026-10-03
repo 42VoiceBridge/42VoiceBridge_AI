@@ -1,3 +1,9 @@
+> **SUPERSEDED 2026-09-25 by `AI_STATUS_FOR_BACKEND_CLAUDE_v2_EN.md`.** Kept for the record.
+> This version overstates what is implemented (it says the demo implements every endpoint, that
+> `contract_version` is on every response, and that raw WAV is a global convention) and predates
+> the JPyRust transport decision, the `core_*` entrypoints and the 2026-09-23 defect review.
+> **Do not hand this file to Claude; hand v2.**
+
 # AI Inference Server — Backend Integration Spec v1 (context file for Claude)
 
 Contract `ai-contract-v1` · 2026-09-18 · AI owner: 제민 (jaemyu, AI/Data) · Team: 42VoiceBridge

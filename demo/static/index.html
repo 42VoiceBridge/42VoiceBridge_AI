@@ -76,6 +76,9 @@ audio{width:100%;margin-top:8px}
 <script>
 const $ = id => document.getElementById(id);
 let wavBlob = null, tx = null, conf = null, dirty = false, sampleRef = null, health = null;
+// D-6 guard: every edit, cancel or new recording bumps `gen`. A reply that comes back with an
+// old `gen` is stale and must not speak, un-dirty the draft, or overwrite the text box.
+let gen = 0;
 
 function setState(msg, cls){ const s=$('state'); s.textContent=msg||''; s.className='state '+(cls||''); }
 function uuid(){ return (crypto.randomUUID ? crypto.randomUUID() : String(Date.now())+Math.random()); }
@@ -157,6 +160,7 @@ $('rec').onclick = async ()=>{
 $('file').onchange = e=>{ const f=e.target.files[0]; if(f) setAudio(f); };
 
 function resetResult(){
+  gen++;
   tx=null; conf=null; dirty=false;
   $('text').value=''; $('text').disabled=true; $('meta').textContent=''; setState('');
   ['confirm','speak','cancel'].forEach(b=>$(b).disabled=true);
@@ -167,44 +171,52 @@ $('go').onclick = async ()=>{
   if(!wavBlob) return;
   resetResult(); setState('인식 중…'); $('go').disabled=true;
   const q = new URLSearchParams({user_id:$('user').value, use_adapter:String($('useAdapter').checked && !$('useAdapter').disabled), request_id:uuid()});
+  const g = gen;
   try{
-    tx = await api('/v1/asr/transcribe?'+q, {method:'POST', headers:{'Content-Type':'audio/wav'}, body:wavBlob});
+    const r = await api('/v1/asr/transcribe?'+q, {method:'POST', headers:{'Content-Type':'audio/wav'}, body:wavBlob});
+    if(g !== gen){ $('go').disabled=false; return; }   // cancelled or re-recorded while decoding
+    tx = r;
     $('text').value = tx.text; $('text').disabled=false;
     const m = tx.model;
     $('meta').textContent = `모델 ${m.base_model}${m.adapter_id? ' + 어댑터 '+m.adapter_id : ' (어댑터 없음)'} · ${tx.audio.duration_sec}s · ${tx.latency_ms} ms · 후보 ${tx.alternatives.length}개 · 점수 ${tx.score===null?'없음':tx.score}`;
     if(tx.status==='no_speech'){ setState('말소리를 찾지 못했습니다. 다시 녹음해 주세요.', 'warn'); }
     else { setState('맞는지 확인해 주세요. 틀린 곳은 고친 뒤 확인을 누르세요.', 'warn'); $('confirm').disabled=false; }
     $('cancel').disabled=false;
-  }catch(e){ setState('인식 실패: '+(e.message||e.code), 'bad'); }
+  }catch(e){ if(g === gen) setState('인식 실패: '+(e.message||e.code), 'bad'); }
   $('go').disabled=false;
 };
 
 $('text').oninput = ()=>{
-  if(conf){ dirty=true; $('speak').disabled=true; setState('문장이 바뀌었습니다. 다시 확인해야 읽을 수 있습니다.', 'warn'); }
+  if(conf){ gen++; dirty=true; $('speak').disabled=true; setState('문장이 바뀌었습니다. 다시 확인해야 읽을 수 있습니다.', 'warn'); }
   $('confirm').disabled = !$('text').value.trim();
 };
 
 $('confirm').onclick = async ()=>{
+  const g = gen;
   try{
-    conf = await api(`/v1/transcriptions/${tx.transcription_id}/confirm`, {method:'POST', headers:{'Content-Type':'application/json'},
+    const c = await api(`/v1/transcriptions/${tx.transcription_id}/confirm`, {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({revision:tx.revision, confirmed_text:$('text').value, consent:{store_audio:false, use_for_training:false}})});
+    if(g !== gen) return;        // text was edited or cancelled while confirming: do NOT un-dirty
+    conf = c;
     dirty=false; $('speak').disabled=false;
     setState(conf.source==='user_edited' ? `확인됨 (직접 고침, ${conf.edit_distance_syl}음절 수정)` : '확인됨', 'ok');
-  }catch(e){ setState('확인 실패: '+(e.message||e.code), 'bad'); }
+  }catch(e){ if(g === gen) setState('확인 실패: '+(e.message||e.code), 'bad'); }
 };
 
 $('speak').onclick = async ()=>{
   if(!conf || dirty) return;
+  const g = gen;
   $('speak').disabled = true;
   try{
     const t = await api('/v1/tts', {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({confirmation_id:conf.confirmation_id, idempotency_key:uuid()})});
+    if(g !== gen || !conf || dirty) return;   // edited or cancelled while the server answered
     const u = new SpeechSynthesisUtterance(t.text); u.lang='ko-KR';
     const v = speechSynthesis.getVoices().find(v=>v.lang && v.lang.startsWith('ko'));
     if(v) u.voice=v; else setState('이 브라우저에 한국어 음성이 없습니다.', 'warn');
     u.onend = ()=>{ $('speak').disabled = dirty; };
     speechSynthesis.cancel(); speechSynthesis.speak(u);
-  }catch(e){ setState('읽기 거부: '+(e.message||e.code), 'bad'); $('speak').disabled=false; }
+  }catch(e){ if(g === gen){ setState('읽기 거부: '+(e.message||e.code), 'bad'); $('speak').disabled=false; } }
 };
 
 $('cancel').onclick = ()=>{ speechSynthesis.cancel(); resetResult(); setState('취소했습니다.'); };

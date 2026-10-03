@@ -136,9 +136,48 @@ paths:
         "501": {$ref: "#/components/responses/Error"}
   /v1/adapters/train:
     post:
-      summary: "[planned] Start an adapter training job. 501 in the v1 demo."
+      summary: >
+        Queue a per-user adapter training job. 202 as of 2026-10-03 (was 501). Enrollment audio
+        and texts must already be readable by this server; there is no ingest route yet, so the
+        backend cannot deliver them over HTTP (backend question T3, unresolved).
+      parameters:
+        - in: query
+          name: user_id
+          required: false
+          schema: {type: string}
+          description: "Required; may instead be sent as a JSON body field user_id."
       responses:
-        "501": {$ref: "#/components/responses/Error"}
+        "202":
+          description: Job accepted. Training and the held-out gate run asynchronously.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Job"}
+        "400": {$ref: "#/components/responses/Error"}
+        "404":
+          description: >
+            no_enrollment - no pairs.json for this user. The error carries expected_path.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+  /v1/jobs/{job_id}:
+    get:
+      summary: Training job state. Added 2026-10-03; the backend maps these onto its own enum.
+      parameters:
+        - in: path
+          name: job_id
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Job record
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Job"}
+        "404":
+          description: unknown_job. There is no distinction between never-existed and expired.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
 components:
   responses:
     Error:
@@ -157,6 +196,56 @@ components:
                   message: {type: string}
                 additionalProperties: true
   schemas:
+    Error:
+      type: object
+      properties:
+        contract_version: {type: string}
+        error:
+          type: object
+          properties:
+            code: {type: string}
+            message: {type: string}
+    Job:
+      type: object
+      description: >
+        A job is NOT an adapter. state=promoted means the candidate beat the incumbent on the
+        held-out gate AND the active pointer was rewritten; rejected means it did not (a tie does
+        not promote) and is a normal outcome, not a failure. There is no numeric progress field -
+        do not synthesise one.
+      required: [job_id, user_id, state, contract_version]
+      properties:
+        contract_version: {type: string}
+        job_id: {type: string}
+        user_id: {type: string}
+        state:
+          type: string
+          enum: [queued, running, evaluating, promoted, rejected, needs_review, failed]
+        created_at: {type: string}
+        updated_at: {type: string}
+        min_enroll:
+          type: integer
+          description: Policy, not evidence. The minimum enrollment count was never measured.
+        min_gate: {type: integer}
+        n_enroll: {type: integer}
+        n_train: {type: integer}
+        n_dev: {type: integer}
+        n_gate: {type: integer}
+        incumbent_adapter:
+          type: string
+          nullable: true
+          description: null means the comparison was against the BASE model.
+        incumbent_cer_jamo: {type: number}
+        new_cer_jamo: {type: number}
+        decision: {type: string}
+        adapter_id:
+          type: string
+          nullable: true
+          description: Present only when state=promoted.
+        previous_active:
+          type: string
+          nullable: true
+          description: The adapter this one replaced, kept for rollback.
+        error: {type: string}
     ModelInfo:
       type: object
       required: [engine, base_model, base_revision, adapter_id, adapter_revision]

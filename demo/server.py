@@ -45,14 +45,22 @@ PREPROC_VERSION = "pp-v1"          # WAV PCM16 mono 16 kHz, no resampling, no VA
 MIN_SEC, MAX_SEC = 0.3, 30.0
 SILENCE_DBFS = -60.0               # heuristic, not validated: below this RMS -> no_speech
 BASE = os.environ.get("ASR_BASE", "openai/whisper-small")
+# D-5: every adapter we ship was trained against this snapshot. Loading any other one silently
+# mismatches them, so it is pinned here and checked after load. Same hash as
+# experiments/t10_highcer/eval_longform.py and b1_train.py.
+BASE_REVISION = os.environ.get("ASR_BASE_REVISION", "973afd24965f72e36ca33b3055d56a652f456b4d")
 # Greedy by default (D9, 2026-09-18). At beam_size=5 whisper-small emitted repetition loops on
 # short utterances (`아, 그래요?` -> 200 tokens of `아`), and one such segment can dominate a
 # pooled CER. Accuracy is NOT the reason for greedy: it is a wash (better on the KJW test split,
 # worse on the 10 demo samples). The reasons are that greedy cannot produce the loop, and median
 # demo latency fell 1554 -> 666 ms. See HO §5.2 and CT §0 D9.
-BEAMS = int(os.environ.get("ASR_BEAMS", "1"))
+import decoding                      # the one generation configuration (A2, 2026-10-03)
+BEAMS = decoding.BEAMS
+MAX_BODY = 5 * 1024 * 1024        # request body cap, shared by both framings
 ENGINE = os.environ.get("ASR_ENGINE", "hf")
 ADAPTER_DIR = os.environ.get("ASR_ADAPTERS", os.path.join(HERE, "adapters"))
+POOL_VERSION = "script-pool-v1"   # bump when the pool file is replaced
+POOL_SHA = None                   # content hash of the SELECTED items, filled on first load
 POOL = os.environ.get("PROMPT_POOL", os.path.join(os.path.dirname(HERE), "data", "script_pool.json"))
 
 
@@ -111,6 +119,16 @@ class MockEngine:
         for aid, meta in scan_adapters(ADAPTER_DIR).items():
             self.adapters[aid] = meta
 
+    def ensure_adapter(self, aid):
+        """A3: load an adapter written AFTER startup. Returns (meta, error)."""
+        if aid in self.adapters:
+            return self.adapters[aid], None
+        meta = scan_adapters(ADAPTER_DIR).get(aid)
+        if meta is None:
+            return None, "not_found"
+        self.adapters[aid] = meta
+        return meta, None
+
     def transcribe(self, x, adapter_id):
         n = int(len(x) / 16000 * 2)
         text = "모의 인식 결과" + (" 어댑터" if adapter_id else "") + " " + "가" * max(0, n - 6)
@@ -125,22 +143,35 @@ class HFEngine:
         from transformers import WhisperForConditionalGeneration, WhisperProcessor
         self.torch = torch
         self.device = os.environ.get("ASR_DEVICE", "cpu")
-        self.proc = WhisperProcessor.from_pretrained(BASE, language="korean", task="transcribe")
-        m = WhisperForConditionalGeneration.from_pretrained(BASE)
+        self.proc = WhisperProcessor.from_pretrained(BASE, revision=BASE_REVISION,
+                                                     language="korean", task="transcribe")
+        m = WhisperForConditionalGeneration.from_pretrained(BASE, revision=BASE_REVISION)
         try:
             m.generation_config.forced_decoder_ids = None
         except Exception:                                     # noqa: BLE001
             pass
         self.base_model = BASE
         self.base_revision = getattr(m.config, "_commit_hash", None)
+        # D-5: the revision was recorded but never enforced, so the hub could have served a
+        # different snapshot and every adapter trained against the pinned one would be mismatched.
+        if BASE_REVISION and self.base_revision not in (None, BASE_REVISION):
+            raise RuntimeError("base revision mismatch: loaded %s, pinned %s"
+                               % (self.base_revision, BASE_REVISION))
         self.model = m.to(self.device).eval()
         self.peft = False
         self.adapters = {}
+        self.failed = {}                      # adapter_id -> why it could not be loaded
         for aid, meta in scan_adapters(ADAPTER_DIR).items():
-            if meta.get("base_model") not in (None, BASE):
-                print("skip adapter %s: trained on %s, server base is %s" % (
-                    aid, meta.get("base_model"), BASE))
-                continue
+            self._load(aid, meta)
+
+    def _load(self, aid, meta):
+        """Load one adapter into the live model. Returns None on success, else a reason string."""
+        if meta.get("base_model") not in (None, BASE):
+            why = "trained on %s, server base is %s" % (meta.get("base_model"), BASE)
+            print("skip adapter %s: %s" % (aid, why))
+            self.failed[aid] = "base_mismatch"
+            return "base_mismatch"
+        try:
             from peft import PeftModel
             if not self.peft:
                 self.model = PeftModel.from_pretrained(self.model, meta["path"], adapter_name=aid)
@@ -148,15 +179,36 @@ class HFEngine:
             else:
                 self.model.load_adapter(meta["path"], adapter_name=aid)
             self.model.eval()
-            self.adapters[aid] = meta
-            print("loaded adapter %s (%s)" % (aid, meta.get("user_id")))
+        except Exception as e:                                # noqa: BLE001
+            print("adapter %s failed to load: %s" % (aid, e))
+            self.failed[aid] = "load_error"
+            return "load_error"
+        self.adapters[aid] = meta
+        self.failed.pop(aid, None)
+        print("loaded adapter %s (%s)" % (aid, meta.get("user_id")))
+        return None
+
+    def ensure_adapter(self, aid):
+        """A3: the worker writes adapters AFTER startup, so a miss must rescan, not fall back.
+
+        Returns (meta, error). A previous hard failure is remembered so a broken adapter does not
+        re-attempt a model mutation on every request.
+        """
+        if aid in self.adapters:
+            return self.adapters[aid], None
+        if aid in self.failed:
+            return None, self.failed[aid]
+        meta = scan_adapters(ADAPTER_DIR).get(aid)
+        if meta is None:
+            return None, "not_found"
+        why = self._load(aid, meta)
+        return (None, why) if why else (self.adapters[aid], None)
 
     def transcribe(self, x, adapter_id):
         torch = self.torch
         f = self.proc.feature_extractor(x, sampling_rate=16000, return_tensors="pt").input_features
         f = f.to(self.device)
-        kw = dict(input_features=f, language="korean", task="transcribe", num_beams=BEAMS,
-                  max_new_tokens=200)
+        kw = dict(input_features=f, **decoding.settings())
         with torch.no_grad():
             if adapter_id:
                 self.model.set_adapter(adapter_id)
@@ -208,6 +260,7 @@ class Store:
         self.conf = {}        # confirmation_id -> confirmation
         self.latest_conf = {} # transcription_id -> confirmation_id (latest valid)
         self.tts = {}         # idempotency_key -> tts record
+        self.by_request = {}  # (user_id, request_id) -> transcription_id   (D-3)
 
 
 STORE = Store()
@@ -216,10 +269,41 @@ ENG = None
 POOL_ITEMS = None
 
 
+def active_map():
+    """user_id -> adapter_id, from adapters/active.json. Missing file or entry means the BASE model.
+
+    D-4: selection used to be "newest created_at wins", so an adapter that had never been validated
+    became live the moment it was written. Serving the base is a supported state, not a failure:
+    the 2026-09-26 run measured a speaker for whom every adapter was worse than the base.
+    """
+    p = os.path.join(ADAPTER_DIR, "active.json")
+    if not os.path.isfile(p):
+        return {}
+    try:
+        m = json.load(open(p, encoding="utf-8"))
+    except Exception as e:                                    # noqa: BLE001
+        print("active.json unreadable (%s); serving the base model for everyone" % e)
+        return {}
+    return m if isinstance(m, dict) else {}
+
+
 def user_adapter(user_id):
-    act = [m for m in ENG.adapters.values() if m.get("user_id") == user_id]
-    act.sort(key=lambda m: m.get("created_at", ""), reverse=True)
-    return act[0] if act else None
+    """(meta, reason). meta is None whenever the BASE model will run; reason says why.
+
+    A5: `adapter_id: null` used to be ambiguous between "base was requested", "the pointer is
+    missing" and "the adapter would not load". The reason is now reported in the response.
+    """
+    aid = active_map().get(user_id)
+    if not aid:
+        return None, "no_active_adapter"
+    ad, err = ENG.ensure_adapter(aid)        # A3: rescans, so an adapter promoted after startup loads
+    if ad is None:
+        print("active adapter %r for %r unusable (%s); serving the base" % (aid, user_id, err))
+        return None, "adapter_" + (err or "unavailable")
+    if ad.get("user_id") != user_id:
+        print("active.json maps %r to an adapter owned by %r; refusing" % (user_id, ad.get("user_id")))
+        return None, "adapter_wrong_owner"
+    return ad, None
 
 
 def syl_edit_distance(a, b):
@@ -236,10 +320,18 @@ def syl_edit_distance(a, b):
 
 
 # ------------------------------------------------------------------ handlers
-def h_health(q, body):
-    return 200, dict(status="ok", contract_version=CONTRACT_VERSION, engine=ENG.name,
+# ---------------------------------------------------------------- core (no HTTP in here)
+# These four functions ARE the contract. The HTTP handlers below only parse and hand over, and
+# the JPyRust Python daemon calls the same functions directly (decided 2026-09-25: the backend
+# is Java and reaches this process over JNI + shared memory, not HTTP). Anything transport
+# specific - status codes, query strings, raw bodies - stays out of them.
+
+
+def core_health():
+    return dict(status="ok", contract_version=CONTRACT_VERSION, engine=ENG.name,
                      base_model=ENG.base_model, base_revision=ENG.base_revision,
                      preprocessing_version=PREPROC_VERSION, beam_size=BEAMS,
+                     generation=decoding.describe(),
                      adapters=[dict(adapter_id=m["adapter_id"], user_id=m["user_id"],
                                     adapter_revision=m["adapter_revision"],
                                     size_bytes=m["size_bytes"], label=m.get("label"),
@@ -249,14 +341,25 @@ def h_health(q, body):
                                  channels=1, bits=16))
 
 
-def h_transcribe(q, body):
-    user_id = (q.get("user_id") or [""])[0].strip()
+def core_transcribe(audio_wav, user_id, use_adapter=True, request_id=None):
+    """audio_wav: raw WAV bytes (PCM16 mono 16 kHz). Returns the transcription record."""
+    user_id = (user_id or "").strip()
     if not user_id:
-        raise ApiError(400, "missing_user_id", "user_id query parameter is required")
-    use_adapter = (q.get("use_adapter") or ["true"])[0].lower() != "false"
-    request_id = (q.get("request_id") or [str(uuid.uuid4())])[0]
+        raise ApiError(400, "missing_user_id", "user_id is required")
+    # D-3: request_id used to be echoed and otherwise ignored, so a client retry after a timeout
+    # ran inference again and produced a second transcription_id for one user action. Now the
+    # first result comes back unchanged. Keyed per user so ids cannot collide across users, and
+    # only for client-supplied ids - a generated one can never be retried against.
+    client_rid = (request_id or "").strip() or None
+    if client_rid:
+        with STORE.lock:
+            prev = STORE.by_request.get((user_id, client_rid))
+            if prev:
+                return STORE.tx[prev]
+    request_id = client_rid or str(uuid.uuid4())
+    body = audio_wav
     x, dur, dbfs = parse_wav(body)
-    ad = user_adapter(user_id) if use_adapter else None
+    ad, adapter_note = (user_adapter(user_id) if use_adapter else (None, "base_requested"))
     t0 = time.time()
     if dbfs < SILENCE_DBFS:
         text, status = "", "no_speech"
@@ -270,21 +373,32 @@ def h_transcribe(q, body):
         alternatives=[], score=None, score_type=None,
         model=dict(engine=ENG.name, base_model=ENG.base_model, base_revision=ENG.base_revision,
                    adapter_id=ad["adapter_id"] if ad else None,
-                   adapter_revision=ad["adapter_revision"] if ad else None),
-        decoding=dict(language="ko", task="transcribe", beam_size=BEAMS),
+                   adapter_revision=ad["adapter_revision"] if ad else None,
+                   # A5: why the base ran, when it ran. null when an adapter ran.
+                   base_reason=adapter_note),
+        decoding=decoding.describe(),
         audio=dict(sha256=sha256(body), duration_sec=round(dur, 3), rms_dbfs=dbfs,
                    preprocessing_version=PREPROC_VERSION),
         latency_ms=int((time.time() - t0) * 1000), created_at=now())
     with STORE.lock:
         STORE.tx[res["transcription_id"]] = res
-    return 200, res
+        if client_rid:
+            STORE.by_request[(user_id, client_rid)] = res["transcription_id"]
+    return res
 
 
-def h_confirm(tid, body):
-    try:
-        req = json.loads(body or b"{}")
-    except ValueError:
-        raise ApiError(400, "bad_json", "body must be JSON")
+def _consent_flag(consent, name):
+    """Strict: only a real JSON boolean grants permission. `"false"` used to become True."""
+    v = consent.get(name, False)
+    if isinstance(v, bool):
+        return v
+    raise ApiError(422, "invalid_consent",
+                   "consent.%s must be a JSON boolean, got %s" % (name, type(v).__name__))
+
+
+def core_confirm(tid, req):
+    if not isinstance(req, dict):
+        raise ApiError(400, "bad_request", "body must be a JSON object")
     with STORE.lock:
         tx = STORE.tx.get(tid)
         if not tx:
@@ -296,48 +410,80 @@ def h_confirm(tid, body):
         if not text:
             raise ApiError(422, "empty_text", "confirmed_text is empty; use cancel instead")
         consent = req.get("consent") or {}
+        if not isinstance(consent, dict):
+            raise ApiError(422, "invalid_consent", "consent must be a JSON object")
         prev = STORE.latest_conf.get(tid)
         c = dict(confirmation_id=str(uuid.uuid4()), transcription_id=tid,
+                 contract_version=CONTRACT_VERSION,
                  based_on_revision=tx["revision"], confirmed_text=text,
                  text_sha256=sha256(text.encode("utf-8")),
                  source="asr_unedited" if text == tx["text"] else "user_edited",
                  edit_distance_syl=syl_edit_distance(tx["text"], text),
-                 consent=dict(store_audio=bool(consent.get("store_audio", False)),
-                              use_for_training=bool(consent.get("use_for_training", False))),
+                 consent=dict(store_audio=_consent_flag(consent, "store_audio"),
+                              use_for_training=_consent_flag(consent, "use_for_training")),
                  supersedes=prev, valid=True, confirmed_at=now())
         if prev:
             STORE.conf[prev]["valid"] = False
         STORE.conf[c["confirmation_id"]] = c
         STORE.latest_conf[tid] = c["confirmation_id"]
-    return 200, c
+    return c
 
 
-def h_tts(q, body):
-    try:
-        req = json.loads(body or b"{}")
-    except ValueError:
-        raise ApiError(400, "bad_json", "body must be JSON")
+def core_tts(req):
+    if not isinstance(req, dict):
+        raise ApiError(400, "bad_request", "body must be a JSON object")
     cid, key = req.get("confirmation_id"), req.get("idempotency_key")
     if not cid or not key:
         raise ApiError(400, "missing_field", "confirmation_id and idempotency_key are required")
     with STORE.lock:
-        if key in STORE.tts:
-            r = dict(STORE.tts[key])
-            if r["confirmation_id"] != cid:
-                raise ApiError(409, "idempotency_key_reused", "key already used for another text")
-            r["replayed"] = True
-            return 200, r
+        # validity FIRST: a cached authorization must never resurrect superseded text.
         c = STORE.conf.get(cid)
         if not c:
             raise ApiError(404, "unknown_confirmation", "no such confirmation_id")
         if not c["valid"]:
             raise ApiError(409, "confirmation_superseded",
                            "text was edited after this confirmation; confirm again")
-        r = dict(tts_id=str(uuid.uuid4()), confirmation_id=cid, text=c["confirmed_text"],
+        if key in STORE.tts:
+            r = dict(STORE.tts[key])
+            if r["confirmation_id"] != cid:
+                raise ApiError(409, "idempotency_key_reused", "key already used for another text")
+            r["replayed"] = True
+            return r
+        r = dict(contract_version=CONTRACT_VERSION,
+                 tts_id=str(uuid.uuid4()), confirmation_id=cid, text=c["confirmed_text"],
                  text_sha256=c["text_sha256"], engine="client_speech_synthesis",
                  replayed=False, created_at=now())
         STORE.tts[key] = r
-    return 200, r
+    return r
+
+
+# ---------------------------------------------------------------- HTTP handlers (thin)
+
+
+def h_health(q, body):
+    return 200, core_health()
+
+
+def h_transcribe(q, body):
+    return 200, core_transcribe(body, (q.get("user_id") or [""])[0],
+                                (q.get("use_adapter") or ["true"])[0].lower() != "false",
+                                (q.get("request_id") or [None])[0])
+
+
+def _json_body(body):
+    try:
+        req = json.loads(body or b"{}")
+    except ValueError:
+        raise ApiError(400, "bad_json", "body must be JSON")
+    return req
+
+
+def h_confirm(tid, body):
+    return 200, core_confirm(tid, _json_body(body))
+
+
+def h_tts(q, body):
+    return 200, core_tts(_json_body(body))
 
 
 def h_jamo(q, body):
@@ -348,7 +494,9 @@ def h_jamo(q, body):
     pairs = req.get("pairs") or []
     if not isinstance(pairs, list) or not pairs:
         raise ApiError(422, "no_pairs", "pairs must be a non-empty list of {ref, hyp}")
-    return 200, jamo_stats.compute(pairs, int(req.get("min_support", 20)))
+    out = jamo_stats.compute(pairs, int(req.get("min_support", 20)))
+    out["contract_version"] = CONTRACT_VERSION
+    return 200, out
 
 
 def h_prompts(q, body):
@@ -367,20 +515,61 @@ def h_prompts(q, body):
         d = json.load(open(POOL, encoding="utf-8"))
         # sentence-level catalogue entries only (task codes 02-03, 02-04, 06-01)
         POOL_ITEMS = sorted((k, v) for k, v in d.items() if k[:5] in ("02-03", "02-04", "06-01"))
+        # R5 (backend, 2026-10-03): the same seed can return different prompts if the pool changes.
+        # This hashes the SELECTED items, so it identifies what recommendations are drawn from -
+        # deliberately not the strategy version, which identifies the algorithm.
+        global POOL_SHA
+        POOL_SHA = hashlib.sha256(
+            "\n".join("%s\t%s" % kv for kv in POOL_ITEMS).encode("utf-8")).hexdigest()[:16]
     excl = set(req.get("exclude_prompt_ids") or [])
     cand = [kv for kv in POOL_ITEMS if kv[0] not in excl]
     n = max(1, min(int(req.get("n", 10)), 50))
     rnd = random.Random(req.get("seed", 0))
     pick = rnd.sample(cand, min(n, len(cand)))
-    return 200, dict(strategy="random", strategy_version="prompt-random-v1",
+    return 200, dict(contract_version=CONTRACT_VERSION,
+                     strategy="random", strategy_version="prompt-random-v1",
                      seed=req.get("seed", 0), pool_size=len(POOL_ITEMS),
+                     pool_version=POOL_VERSION, pool_sha256=POOL_SHA,
                      prompts=[dict(prompt_id=k, text=v) for k, v in pick])
 
 
+def core_train(user_id):
+    """Queue a per-user adapter run. Promotion is decided by train_worker's held-out gate."""
+    user_id = (user_id or "").strip()
+    if not user_id:
+        raise ApiError(400, "missing_user_id", "user_id is required")
+    import train_worker
+    d = os.path.join(train_worker.ENROLL_DIR, user_id)
+    if not os.path.isfile(os.path.join(d, "pairs.json")):
+        raise ApiError(404, "no_enrollment",
+                       "no enrollment for this user; upload pairs.json and the audio first",
+                       expected_path=os.path.join(d, "pairs.json"))
+    job = train_worker.submit(user_id)
+    job["contract_version"] = CONTRACT_VERSION
+    return job
+
+
+def core_job(job_id):
+    import train_worker
+    job = train_worker.read_job((job_id or "").strip())
+    if not job:
+        raise ApiError(404, "unknown_job", "no such job_id")
+    job["contract_version"] = CONTRACT_VERSION
+    return job
+
+
 def h_train(q, body):
-    raise ApiError(501, "not_implemented_in_demo",
-                   "v1 trains offline (b1_train.py on Colab); job API is specified in the "
-                   "contract but not served by this demo")
+    uid = (q.get("user_id") or [""])[0]
+    if not uid and body:
+        try:
+            uid = (json.loads(body) or {}).get("user_id", "")
+        except ValueError:
+            raise ApiError(400, "bad_json", "body must be JSON")
+    return 202, core_train(uid)
+
+
+def h_job(job_id):
+    return 200, core_job(job_id)
 
 
 # ------------------------------------------------------------------ http plumbing
@@ -397,8 +586,31 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(b)
 
     def _body(self):
+        # R3 (backend, 2026-10-03): Spring's RestClient can send JSON with
+        # `Transfer-Encoding: chunked` and no Content-Length. Reading Content-Length alone gave an
+        # empty body and a misleading 422. Both framings are accepted now.
+        if (self.headers.get("Transfer-Encoding") or "").lower().strip() == "chunked":
+            out, total = [], 0
+            while True:
+                line = self.rfile.readline(65).strip()
+                if b";" in line:
+                    line = line.split(b";", 1)[0]
+                try:
+                    size = int(line, 16)
+                except ValueError:
+                    raise ApiError(400, "bad_chunked_body", "malformed chunk size")
+                if size == 0:
+                    while self.rfile.readline(65).strip():      # trailers
+                        pass
+                    break
+                total += size
+                if total > MAX_BODY:
+                    raise ApiError(413, "body_too_large", "max 5 MB")
+                out.append(self.rfile.read(size))
+                self.rfile.read(2)                              # CRLF after each chunk
+            return b"".join(out)
         n = int(self.headers.get("Content-Length") or 0)
-        if n > 5 * 1024 * 1024:
+        if n > MAX_BODY:
             raise ApiError(413, "body_too_large", "max 5 MB")
         return self.rfile.read(n) if n else b""
 
@@ -430,11 +642,14 @@ class H(BaseHTTPRequestHandler):
                 return self._send(*h_jamo(q, body))
             if method == "POST" and p == "/v1/enroll/next-prompts":
                 return self._send(*h_prompts(q, body))
+            if method == "GET" and p.startswith("/v1/jobs/"):
+                return self._send(*h_job(p.split("/")[3]))
             if method == "POST" and p == "/v1/adapters/train":
                 return self._send(*h_train(q, body))
             raise ApiError(404, "not_found", "no route %s %s" % (method, p))
         except ApiError as e:
-            return self._send(e.http, dict(error=dict(code=e.code, message=e.message, **e.detail)))
+            return self._send(e.http, dict(contract_version=CONTRACT_VERSION,
+                                           error=dict(code=e.code, message=e.message, **e.detail)))
         except Exception as e:                                           # noqa: BLE001
             return self._send(500, dict(error=dict(code="internal", message=repr(e))))
 

@@ -55,16 +55,21 @@ def sh(cmd, dry):
 
 def evaluate(spk, system, adapter, dec, vad, es, dry):
     sys.path.insert(0, BASE)
-    from eval_longform import CODE_VERSION, out_name
+    from eval_longform import BASE_REVISION, CODE_VERSION, out_name
     fid = EVAL[spk]
     mask = os.path.join(BASE, "masks", fid + ".json")
     out = os.path.join(LONG, out_name(fid, system, dec, vad, es))
     cell = dict(speaker=spk, system=system, decoder="nr%d" % dec if dec else "default",
                 vad="silero" if vad else "off", eval_seed=es)
+    # 2026-09-26 (GPT review): the fingerprint omitted the inputs, so a result produced from
+    # different audio or a different base revision would have been reused. Library versions and the
+    # resolved generation config are still only covered indirectly, through CODE_VERSION.
+    wav = os.path.join(BASE, "t10_16k", fid + ".wav")
     want = dict(adapter_sha256=sha_file(os.path.join(adapter, "adapter_model.safetensors"))
                 if adapter and not dry else None, eval_seed=es, code_version=CODE_VERSION,
                 vad_mask_sha256=json.load(open(mask))["mask_sha256"] if vad else None,
-                no_repeat_ngram=dec)
+                no_repeat_ngram=dec, base_revision=BASE_REVISION,
+                audio_sha256=sha_file(wav) if not dry and os.path.exists(wav) else None)
     if os.path.exists(out):
         have = json.load(open(out, encoding="utf-8"))
         if all(have.get(k) == v for k, v in want.items()):
