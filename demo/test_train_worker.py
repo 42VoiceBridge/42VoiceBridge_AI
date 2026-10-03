@@ -150,6 +150,30 @@ def main():
     assert len(tr) + len(dv) + len(gt) == 30
     ok += 1
 
+    # T26 item 2: a second training round must not move a past training item into the gate.
+    # Driven through the worker's own state dir, so this also proves splits.json lands where the
+    # worker looks for it - the selftest only exercises the function.
+    sd = os.path.join(W.ENROLL_DIR, "erin")
+    os.makedirs(sd, exist_ok=True)
+    r1 = [dict(file="r1_%02d.wav" % i) for i in range(18)]
+    tr1, dv1, gt1 = W.split_pairs(r1, "erin", sd)
+    assert os.path.isfile(W.split_state_path(sd)), "splits.json was not persisted"
+    trained = names(tr1) | names(dv1)
+    r2 = r1 + [dict(file="r2_%02d.wav" % i) for i in range(22)]
+    tr2, dv2, gt2 = W.split_pairs(r2, "erin", sd)
+    assert not (names(gt2) & trained), ("a past training item is now in the gate: %s"
+                                        % sorted(names(gt2) & trained))
+    assert names(gt1) <= names(gt2), "a gate item was moved out of the gate"
+    assert len(tr2) + len(dv2) + len(gt2) == 40
+    ok += 1
+
+    # and the old rank-slicing behaviour would have failed exactly that check
+    ordered = sorted(r2, key=lambda x: __import__("hashlib").sha256(
+        ("erin|" + x["file"]).encode()).hexdigest())
+    old_gate = {x["file"] for x in ordered[:max(W.MIN_GATE, round(40 * 0.20))]}
+    assert old_gate & trained, "regression guard is vacuous: rank-slicing happened not to collide"
+    ok += 1
+
     subprocess.run = real
     shutil.rmtree(TMP, ignore_errors=True)
     print("promotion gate checks passed (%d groups)" % ok)

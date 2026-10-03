@@ -51,16 +51,86 @@ _worker = None
 
 
 # ---------------------------------------------------------------- splits
-def split_pairs(pairs, user_id):
-    """(train, dev, gate). Deterministic: ordered by a hash of user_id + filename."""
-    ordered = sorted(pairs, key=lambda p: hashlib.sha256(
-        (user_id + "|" + p["file"]).encode("utf-8")).hexdigest())
-    n = len(ordered)
+SPLIT_VERSION = "split-v2"
+
+
+def split_state_path(state_dir):
+    return os.path.join(state_dir, "splits.json")
+
+
+def read_split_state(state_dir):
+    """{file: "train"|"dev"|"gate"} assigned in earlier rounds, or {} if none/incompatible."""
+    if not state_dir:
+        return {}
+    p = split_state_path(state_dir)
+    if not os.path.isfile(p):
+        return {}
+    try:
+        d = json.load(open(p, encoding="utf-8"))
+    except ValueError:
+        return {}                              # unreadable state reassigns; it never crashes a job
+    if d.get("split_version") != SPLIT_VERSION:
+        return {}
+    a = d.get("assigned") or {}
+    return {k: v for k, v in a.items() if v in ("train", "dev", "gate")}
+
+
+def write_split_state(state_dir, assigned):
+    p = split_state_path(state_dir)
+    os.makedirs(state_dir, exist_ok=True)
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(dict(split_version=SPLIT_VERSION, assigned=assigned,
+                       updated_at=time.strftime("%Y-%m-%d %H:%M:%S")), f,
+                  ensure_ascii=False, indent=1)
+    os.replace(tmp, p)                         # atomic: a reader never sees a half-written map
+
+
+def split_pairs(pairs, user_id, state_dir=None):
+    """(train, dev, gate). Membership is PERMANENT for an item once assigned.
+
+    2026-10-03 review defect (T26 item 2): this used to hash-rank every item and slice by
+    proportion, so adding enrollment RE-RANKED everything and an item that trained the previous
+    adapter could land in the next round's gate. The gate would then be scoring a model on its
+    own training data and every promotion after the first was unsound.
+
+    Fix is persistence, not a better hash: prior assignments are kept verbatim and only NEW items
+    are placed, into whichever split is furthest below its target. Nothing ever moves. If the set
+    shrinks and a split ends up over target, it stays over - moving an item back is the very thing
+    this prevents. `state_dir` None keeps the function pure (tests, one-shot splits).
+    """
+    n = len(pairs)
     n_gate = max(MIN_GATE, round(n * 0.20))
     n_dev = max(2, round(n * 0.15))
     if n_gate + n_dev + 2 > n:                 # never leave fewer than 2 training items
         return None, None, None
-    return ordered[n_gate + n_dev:], ordered[n_gate:n_gate + n_dev], ordered[:n_gate]
+
+    def rank(x):
+        return hashlib.sha256((user_id + "|" + x["file"]).encode("utf-8")).hexdigest()
+
+    prior = read_split_state(state_dir)
+    groups = {"train": [], "dev": [], "gate": []}
+    new = []
+    for p in sorted(pairs, key=rank):
+        where = prior.get(p["file"])
+        (groups[where] if where else new).append(p)
+
+    target = {"gate": n_gate, "dev": n_dev, "train": n - n_gate - n_dev}
+    for p in new:                              # deterministic: `new` is already in hash order
+        pick = max(("gate", "dev", "train"),
+                   key=lambda k: (target[k] - len(groups[k]), k == "gate", k == "dev"))
+        groups[pick].append(p)
+
+    # the same set must come back in the same order whether an item was placed this round or a
+    # previous one, otherwise the trainer sees a different input order on a rerun
+    for k in groups:
+        groups[k].sort(key=rank)
+
+    if len(groups["train"]) < 2 or len(groups["gate"]) < 1:
+        return None, None, None
+    if state_dir:
+        write_split_state(state_dir, {p["file"]: k for k, v in groups.items() for p in v})
+    return groups["train"], groups["dev"], groups["gate"]
 
 
 def decide(incumbent_cer, new_cer, n_gate):
@@ -184,7 +254,7 @@ def run_job(job):
                                   error="only %d enrollment utterances; policy minimum is %d "
                                         "(needed for a train/dev/gate split that means anything)"
                                         % (len(pairs), MIN_ENROLL)))
-        train, dev, gate = split_pairs(pairs, uid)
+        train, dev, gate = split_pairs(pairs, uid, os.path.join(ENROLL_DIR, uid))
         if train is None:
             return write_job(dict(job, state="failed",
                                   error="cannot split %d utterances into train/dev/gate" % len(pairs)))
@@ -291,6 +361,30 @@ def selftest():
     assert not (set(x["file"] for x in tr) & set(x["file"] for x in gt)), "gate leaked into train"
     assert not (set(x["file"] for x in dv) & set(x["file"] for x in gt)), "gate leaked into dev"
     assert split_pairs(pairs, "u1") == (tr, dv, gt), "split is not deterministic"
+
+    # T26 item 2: membership must survive a later round that adds enrollment.
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        a_tr, a_dv, a_gt = split_pairs(pairs, "u1", td)
+        before = {}
+        for name, grp in (("train", a_tr), ("dev", a_dv), ("gate", a_gt)):
+            for x in grp:
+                before[x["file"]] = name
+        grown = pairs + [dict(file="g%02d.wav" % i) for i in range(40)]
+        b_tr, b_dv, b_gt = split_pairs(grown, "u1", td)
+        after = {}
+        for name, grp in (("train", b_tr), ("dev", b_dv), ("gate", b_gt)):
+            for x in grp:
+                after[x["file"]] = name
+        moved = [f for f, w in before.items() if after[f] != w]
+        assert not moved, "split membership changed across rounds: %s" % moved[:5]
+        # the new items filled the under-target splits, so the gate grew but kept its old members
+        assert len(b_gt) == max(MIN_GATE, round(60 * 0.20)), len(b_gt)
+        assert set(x["file"] for x in a_gt) <= set(x["file"] for x in b_gt)
+        assert split_pairs(grown, "u1", td) == (b_tr, b_dv, b_gt), "not stable on reread"
+        # a corrupt state file reassigns instead of crashing the job
+        open(split_state_path(td), "w").write("{oops")
+        assert split_pairs(grown, "u1", td)[0] is not None
     assert split_pairs(pairs, "u2")[2] != gt, "split does not depend on the user"
     assert split_pairs([dict(file="a.wav")] * 6, "u")[0] is None, "tiny set must refuse to split"
 

@@ -191,7 +191,7 @@ much as ours; we are not treating push as settled.
 | **No authentication** | The server has none. If anything but localhost can reach it, you own the boundary. |
 | **First-request latency** | The model loads at startup, but the first inference after that is ~2.7 s on a laptop CPU (warm: 640–680 ms). Your `read-timeout-ms` is 10000, so you are fine — but do not call it during startup. |
 | **`base_revision` reports `null` when loading from an offline cache** | The weights *are* the pinned revision `973afd24…` (the loader passes it and the cache snapshot path is that hash), but `config._commit_hash` is unset in offline mode, so the server cannot *prove* it to you. Affects your A1/A5. Being fixed by reporting the requested pin and the artifact-confirmed value separately. |
-| **Split membership is not permanent across rounds** | Our split function re-ranks when enrollment grows, so a second training round can place a past training item in the gate. Harmless while each user trains once; must be fixed before any retraining feature. |
+| ~~Split membership is not permanent across rounds~~ **Fixed 2026-10-03** | Membership is now persisted per user in `splits.json` and prior assignments are never recomputed, so a second training round cannot place a past training item in the gate. Listed here rather than deleted, because an earlier version of this document told you it was broken. |
 | **Prompt-pool redistribution terms** | The pool is derived from AI-Hub 013. Its redistribution conditions have not been checked. Do not expose `/v1/enroll/next-prompts` on a public endpoint until that is settled. |
 
 ---
