@@ -99,12 +99,16 @@ jobs:
           set -euo pipefail
           image="$IMAGE:sha-$GITHUB_SHA"
 
-          # AI-Hub audio, labels and anything derived from them must never travel in an image.
+          # AI-Hub audio, label transcripts and adapters must never travel in an image. The prompt
+          # pool is the one exception (team decision 2026-10-05) so it is asserted PRESENT here,
+          # at /app - not under /data, which the host bind-mounts over.
           docker run --rm --entrypoint sh "$image" -ec '
             test "$(id -u)" = 10001
             test -r /app/server.py
             python3 -c "import torch, transformers, peft, numpy"
-            found=$(find /app /data \( -name "*.wav" -o -name "*.safetensors" -o -name "*_manifest.json" -o -name "script_pool.json" \) 2>/dev/null | head -5)
+            test -r /app/script_pool.json || { echo "prompt pool missing from the image" >&2; exit 1; }
+            case "${PROMPT_POOL:-}" in /app/*) ;; *) echo "PROMPT_POOL=$PROMPT_POOL is under the mounted /data and would be hidden" >&2; exit 1;; esac
+            found=$(find /app /data \( -name "*.wav" -o -name "*.safetensors" -o -name "*_manifest.json" \) 2>/dev/null | head -5)
             test -z "$found" || { echo "derived data in the image: $found" >&2; exit 1; }
           '
 
@@ -126,6 +130,20 @@ jobs:
           assert g["num_beams"] == 1 and g["do_sample"] is False, g
           assert h["engine"] == "mock", "verification must not be read as real-engine evidence"
           print("health contract ok")
+          PY
+
+          # The pool is in the image now, so the prompt route must answer without any mount.
+          # Before this it could only be checked with a synthetic fixture outside the container.
+          prompts=$(curl -fsS -X POST -H 'Content-Type: application/json' \
+            -d '{"n":3,"seed":1}' http://127.0.0.1:8000/v1/enroll/next-prompts)
+          python3 - "$prompts" <<'PY'
+          import json, sys
+          p = json.loads(sys.argv[1])
+          assert len(p["prompts"]) == 3, p
+          assert p["pool_size"] == 1807, ("selected pool size changed: %s" % p["pool_size"])
+          assert p["pool_sha256"], p
+          print("prompt pool served from the image: %d entries, sha %s"
+                % (p["pool_size"], p["pool_sha256"]))
           PY
 
       - name: Log in to GHCR

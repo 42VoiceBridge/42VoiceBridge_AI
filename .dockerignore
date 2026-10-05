@@ -12,12 +12,15 @@
 **/*.bin
 **/*_manifest.json
 **/hyp*.json
-**/script_pool.json
 demo/samples
 demo/adapters
 demo/enroll
 demo/jobs
 data
+# 문장 풀만 예외. 팀 결정 2026-10-05: 공모전 시연 범위이고 GHCR 패키지가 비공개여서
+# 이미지를 받을 수 있는 사람이 비공개 저장소를 볼 수 있는 사람과 같다.
+# 음성, 라벨 전사, manifest, 어댑터는 위 규칙대로 계속 제외된다.
+!data/script_pool.json
 experiments
 docs
 .git

@@ -2,11 +2,16 @@
 # on a laptop CPU, and personal-adapter training is asynchronous (17.6 min on CPU vs 18 s on an
 # H100, same selected epoch, byte-identical adapter), so no GPU is required to serve or to train.
 #
-# This image contains CODE ONLY. Three things are deliberately NOT baked in:
+# Two things are deliberately NOT baked in:
 #   - model weights       whisper-small downloads on first start, or mount an HF cache (see below)
-#   - the prompt pool     derived from AI-Hub 013, whose redistribution conditions are unchecked
-#   - adapters            LoRA weights trained on AI-Hub audio, i.e. derived data
-# A published image is a distribution channel. None of the above may travel in one.
+#   - adapters            LoRA weights trained on AI-Hub audio, and per-user state that must
+#                         outlive the image
+#
+# The prompt pool IS baked in, by team decision 2026-10-05: the demo scope is the competition, and
+# the GHCR package is private, so whoever can pull this image is the same set of people who can
+# read the private repository. It lives at /app, NOT under /data - the host bind-mounts /data, which
+# would hide anything the image put there. KEEP THE PACKAGE PRIVATE; making it public distributes
+# AI-Hub-derived text to anyone with the name.
 # Built and run 2026-10-03: 1.61 GB, builds in ~2.5 min, boots with ASR_ENGINE=mock, and serves
 # the REAL engine when an HF cache is mounted at /data/hf (base_revision confirmed
 # 973afd24..., source cache_snapshot_path; first transcribe 3.9 s inside the container).
@@ -31,12 +36,14 @@ RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu 
 
 WORKDIR /app
 COPY --chown=appuser:appuser demo/ /app/
+# 1,807 of 3,436 catalogue entries are selected by task code; see pool_items().
+COPY --chown=appuser:appuser data/script_pool.json /app/script_pool.json
 
 # Writable state. Mount volumes over these: adapters are derived data and must outlive the image.
 ENV ENROLL_DIR=/data/enroll \
     JOB_DIR=/data/jobs \
     ASR_ADAPTERS=/data/adapters \
-    PROMPT_POOL=/data/script_pool.json \
+    PROMPT_POOL=/app/script_pool.json \
     HF_HOME=/data/hf \
     HOST=0.0.0.0 \
     PORT=8000
